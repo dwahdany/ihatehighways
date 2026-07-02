@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass
 from typing import Protocol, Sequence
 
-from . import classify, knapsack, polyline_util
+from . import classify, gmaps, knapsack, osm, polyline_util
 from .classify import Chunk
 from .config import Settings
 from .google_routes import GRoute, GStep, NoRouteError, UpstreamError, WaypointSpec
@@ -402,8 +402,24 @@ async def plan(req: PlanRequest, client: RoutesClient, settings: Settings) -> Pl
         highway_duration_s=round(base_hw_s),
     )
 
-    # 3-4. Stretches -> chunks (budget-adaptively sized) -> parallel detour queries.
+    # 3-4. Stretches -> chunks (budget-adaptively sized) -> OSM pre-filter -> parallel
+    # detour queries (each probe is a paid Google call; OSM gating is free).
     chunks = classify.build_chunks(steps, flags, factors, settings, budget_s=budget_s)
+    if chunks and settings.osm_enabled and not settings.ihh_mock:
+        scores = await osm.score_chunks([(c.entry, c.exit) for c in chunks], settings)
+        kept_chunks = []
+        for chunk, score in zip(chunks, scores):
+            if score is not None and score < settings.osm_min_curvy_km:
+                logger.info(
+                    "skipping chunk [%d,%d): corridor curvy score %.1f km < %.1f km",
+                    chunk.step_start,
+                    chunk.step_end,
+                    score,
+                    settings.osm_min_curvy_km,
+                )
+                continue
+            kept_chunks.append(chunk)
+        chunks = kept_chunks
     candidates = await _query_detours(chunks, client, settings)
 
     # 5. Selection: free detours always, then 0/1 knapsack within the budget.
@@ -436,6 +452,18 @@ async def plan(req: PlanRequest, client: RoutesClient, settings: Settings) -> Pl
     ) + sum(s.hw_in_detour_m for s in spans)
     ride_distance = sum(seg.distance_m for seg in segments)
 
+    handoff = [
+        gmaps.HandoffDetour(
+            entry=s.entry,
+            mid=polyline_util.point_at_fraction(
+                polyline_util.decode(s.route.encoded_polyline), 0.5
+            ),
+            exit=s.exit,
+            value_s=s.baseline_s - s.hw_in_detour_s,
+        )
+        for s in spans
+        if s.route.encoded_polyline
+    ]
     ride = Ride(
         duration_s=round(ride_duration),
         extra_duration_s=round(ride_duration - base.duration_s),
@@ -443,6 +471,7 @@ async def plan(req: PlanRequest, client: RoutesClient, settings: Settings) -> Pl
         highway_distance_m=round(ride_hw_m),
         highway_duration_s=round(ride_hw_s),
         segments=segments,
+        gmaps_url=gmaps.build_gmaps_url(steps[0].start, steps[-1].end, handoff),
     )
     detours = [
         DetourOut(

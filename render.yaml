@@ -1,0 +1,21 @@
+# Render blueprint: free-tier backend for ihatehighways.
+# Free instances spin down after ~15 min idle; first request cold-starts (~30-60 s).
+services:
+  - type: web
+    name: ihatehighways-api
+    runtime: docker
+    rootDir: backend
+    plan: free
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: GOOGLE_MAPS_API_KEY
+        sync: false # set in the Render dashboard, never in git
+      - key: IHH_CORS_ORIGINS
+        value: https://ihatehighways.wahdany.eu
+      - key: TRUST_FORWARDED_FOR
+        value: "1" # behind Cloudflare Worker proxy + Render LB
+      - key: RATE_PER_IP_HOUR
+        value: "10"
+      - key: RATE_DAILY_CAP
+        value: "100"

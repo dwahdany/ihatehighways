@@ -43,6 +43,17 @@ least time to replace — and traffic jams make some replacements *free*.
    the optimizer degenerates to junk micro-detours near the endpoints (observed on real
    Cologne→Frankfurt data).
 
+3b. **OSM corridor pre-filter** — before spending paid Google calls, each chunk's corridor
+   is scored with free OSM data (Overpass, per-chunk bbox query): "excess curvature km"
+   `Σ way_length × (sinuosity − 1.05)⁺` over secondary/tertiary roads. City grids score
+   ≈ 0, real twisty country (e.g. the Westerwald along the A3: ~19) scores high; chunks
+   under `OSM_MIN_CURVY_KM` (2.0) are skipped — no fun roads nearby, no probe. Scores are
+   disk-cached 30 days (ODbL allows it; attribution: © OpenStreetMap contributors) and
+   failures fail OPEN under a hard latency deadline, so Overpass being down costs
+   filtering, never the plan. Ops constraints that shaped this: `around:` polyline
+   filters time out server-side (bbox is cheap), and public instances allow ~2
+   concurrent slots per IP (2 lanes + mirror failover).
+
 4. **Detour query per chunk** (parallel) — `computeRoutes(entry→exit, avoidHighways: true,
    TRAFFIC_AWARE)` where entry/exit are chunk boundary lat/lngs. Set origin `heading` to the base
    polyline's bearing at entry so routing can't start backwards. `avoidHighways` is *soft*

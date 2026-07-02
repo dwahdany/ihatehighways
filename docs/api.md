@@ -40,6 +40,7 @@ Response `200`:
     "distance_m": 214000,
     "highway_distance_m": 42000,
     "highway_duration_s": 1500,
+    "gmaps_url": "https://www.google.com/maps/dir/?api=1&origin=...&waypoints=...",
     "segments": [
       { "kind": "kept",    "encoded_polyline": "...", "duration_s": 640,  "distance_m": 9000 },
       { "kind": "detour",  "encoded_polyline": "...", "duration_s": 3100, "distance_m": 61000 },
@@ -69,13 +70,19 @@ Segments are ordered origin → destination and their polylines concatenate into
 full ride. The frontend colors them: `highway` = signage blue, `detour`/`kept` =
 signage yellow; the fastest route is drawn underneath as a neutral line.
 
-Errors (`400` input / geocoding, `502` upstream):
+`ride.gmaps_url` deep-links the ride into the Google Maps app: each detour is pinned by
+entry, midpoint, and exit waypoints (9 waypoints max — midpoints of the least valuable
+detours are dropped first, then whole detours).
+
+Errors (`400` input / geocoding, `429` rate limited, `502` upstream):
 
 ```json
 { "detail": { "code": "GEOCODE_FAILED", "message": "Could not resolve origin." } }
 ```
 
-Codes: `INVALID_INPUT`, `GEOCODE_FAILED`, `NO_ROUTE`, `UPSTREAM`.
+Codes: `INVALID_INPUT`, `GEOCODE_FAILED`, `NO_ROUTE`, `UPSTREAM`, `RATE_LIMITED`,
+`DAILY_CAP`. The two 429 codes carry rider-ready messages (per-IP hourly window and a
+global daily plan cap protecting the Google quota).
 
 ## `GET /api/health`
 

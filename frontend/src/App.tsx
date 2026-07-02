@@ -27,6 +27,8 @@ function describeError(err: unknown): string {
     case 'GEOCODE_FAILED':
       return ERROR_GEOCODE // backend appends the raw Routes API error — not rider copy
     case 'NO_ROUTE':
+    case 'RATE_LIMITED':
+    case 'DAILY_CAP':
       return err.message // fixed rider-written backend copy
     case 'UPSTREAM':
       // With the envelope this is the backend's own 502 UPSTREAM. Without it,
@@ -108,6 +110,10 @@ function Planner({ apiKey }: { apiKey: string }) {
             )}
             {plan && <TradePanel key={planKey} plan={plan} />}
           </div>
+
+          <p className="attribution">
+            Routing &copy; Google &middot; corridor data &copy; OpenStreetMap contributors
+          </p>
         </aside>
       </div>
     </APIProvider>

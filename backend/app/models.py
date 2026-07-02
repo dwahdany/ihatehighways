@@ -60,6 +60,9 @@ class Ride(BaseModel):
     highway_distance_m: int
     highway_duration_s: int
     segments: list[Segment]
+    # Deep link that reproduces this ride in the Google Maps app (detours pinned via
+    # waypoints, 9 max — least valuable detours lose fidelity first).
+    gmaps_url: str
 
 
 class DetourOut(BaseModel):

@@ -41,6 +41,25 @@ def path_length_m(points: Sequence[Point]) -> float:
     return sum(haversine_m(points[i], points[i + 1]) for i in range(len(points) - 1))
 
 
+def point_at_fraction(points: Sequence[Point], fraction: float) -> Point:
+    """The point at `fraction` (0..1) of the path length, interpolated on the polyline."""
+    if not points:
+        raise ValueError("empty path")
+    if len(points) == 1 or fraction <= 0:
+        return points[0]
+    if fraction >= 1:
+        return points[-1]
+    target = path_length_m(points) * fraction
+    acc = 0.0
+    for a, b in zip(points, points[1:]):
+        seg = haversine_m(a, b)
+        if acc + seg >= target and seg > 0:
+            t = (target - acc) / seg
+            return (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
+        acc += seg
+    return points[-1]
+
+
 def initial_bearing_deg(p1: Point, p2: Point) -> int:
     """Initial great-circle bearing from p1 to p2 as an int in [0, 360]. 0 = N, 90 = E."""
     lat1, lon1 = math.radians(p1[0]), math.radians(p1[1])

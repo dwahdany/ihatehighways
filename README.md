@@ -54,6 +54,20 @@ cd backend && IHH_MOCK=1 uv run uvicorn app.main:app --port 8000
 
 Tests: `cd backend && uv run pytest`.
 
+## Deploy
+
+- **Backend** — Render free tier via [`render.yaml`](render.yaml) (Docker, spins down when
+  idle; set `GOOGLE_MAPS_API_KEY` in the dashboard). Per-IP and daily rate limits guard
+  the Google quota.
+- **Frontend** — Cloudflare Worker in [`worker/`](worker/) serves the built frontend and
+  proxies `/api` same-origin to the backend:
+  `cd frontend && nix-shell -p nodejs_22 --run 'npm run build'`, then
+  `cd worker && npx wrangler deploy`. The custom domain is configured in
+  `worker/wrangler.jsonc`.
+
+Corridor pre-filtering uses OpenStreetMap data via Overpass
+(© OpenStreetMap contributors, ODbL) to decide which Google queries are worth making.
+
 ## Costs & terms (read before scaling)
 
 - One plan ≈ ≤ 14 Routes API calls at the **Pro** SKU ($10/1k, 5k free/month ⇒ ~350 free

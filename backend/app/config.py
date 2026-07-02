@@ -20,6 +20,11 @@ class Settings(BaseSettings):
     google_maps_api_key: str = ""
     ihh_mock: bool = False
     ihh_cors_origins: str = "http://localhost:5173"
+    # Wallet guard for public deployments (uncached plans only).
+    rate_per_ip_hour: int = 10
+    rate_daily_cap: int = 100
+    # Enable behind a trusted reverse proxy so limits apply to the real client IP.
+    trust_forwarded_for: bool = False
 
     # Algorithm tunables (see docs/algorithm.md)
     highway_fast_kmh: float = 90
@@ -42,5 +47,21 @@ class Settings(BaseSettings):
     # A detour must shed at least this fraction of its chunk's highway time, or it never
     # really left the motorway (soft avoidHighways stays on it when leaving is costly).
     min_avoided_fraction: float = 0.5
+
+    # OSM corridor pre-filter: skip Google detour probes for chunks with no fun roads
+    # nearby (saves ~$ per plan and kills junk urban detours at the source).
+    osm_enabled: bool = True
+    # Comma-separated mirror list, tried in order per query.
+    osm_overpass_urls: str = (
+        "https://overpass-api.de/api/interpreter,"
+        "https://overpass.private.coffee/api/interpreter,"
+        "https://overpass.kumi.systems/api/interpreter"
+    )
+    osm_bbox_pad_m: float = 4000
+    osm_min_curvy_km: float = 2.0  # calibrated on real corridors, see docs/algorithm.md
+    osm_timeout_s: float = 10.0  # per query (server-side and client-side)
+    # Overall cap on how long OSM scoring may delay a plan. Unscored chunks fail open,
+    # so when Overpass is having a bad day we lose the filtering, not the plan.
+    osm_deadline_s: float = 12.0
     knapsack_bucket_s: int = 15
     cache_ttl_s: int = 240

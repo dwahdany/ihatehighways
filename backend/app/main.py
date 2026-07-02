@@ -15,6 +15,7 @@ from .config import Settings
 from .google_routes import GoogleRoutesClient, MockRoutesClient
 from .models import PlanRequest, PlanResponse
 from .planner import PlanError, TTLCache, plan
+from .ratelimit import RateLimiter
 
 logger = logging.getLogger("ihatehighways.main")
 
@@ -28,6 +29,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     # ToS: Routes API responses must not be persisted; transient in-memory cache only.
     cache = TTLCache(settings.cache_ttl_s)
+    limiter = RateLimiter(settings.rate_per_ip_hour, settings.rate_daily_cap)
+
+    def client_ip(request: Request) -> str:
+        if settings.trust_forwarded_for:
+            forwarded = request.headers.get("x-forwarded-for", "")
+            first = forwarded.split(",")[0].strip()
+            if first:
+                return first
+        return request.client.host if request.client else "unknown"
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -64,11 +74,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"ok": True, "mock": settings.ihh_mock}
 
     @app.post("/api/plan", response_model=PlanResponse)
-    async def plan_route(req: PlanRequest) -> PlanResponse:
+    async def plan_route(req: PlanRequest, request: Request) -> PlanResponse:
         key = json.dumps(req.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
         cached = cache.get(key)
         if cached is not None:
             return cached  # type: ignore[return-value]
+        # Cached hits are free; only uncached plans (which cost Google calls) count.
+        denied = limiter.check(client_ip(request))
+        if denied == "RATE_LIMITED":
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "code": "RATE_LIMITED",
+                    "message": "Too many plans from this address. Try again in a bit.",
+                },
+            )
+        if denied == "DAILY_CAP":
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "code": "DAILY_CAP",
+                    "message": "Daily planning budget is used up. Back tomorrow.",
+                },
+            )
         try:
             result = await plan(req, client, settings)
         except PlanError as exc:

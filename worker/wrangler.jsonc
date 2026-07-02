@@ -1,0 +1,19 @@
+// Cloudflare Worker: serves the built frontend and proxies /api to the backend.
+// Deploy: cd frontend && npm run build, then cd ../worker && npx wrangler deploy
+{
+  "name": "ihatehighways",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-01",
+  "assets": {
+    "directory": "../frontend/dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application"
+  },
+  "vars": {
+    // Render backend origin; update after the Render service exists.
+    "API_ORIGIN": "https://ihatehighways-api.onrender.com"
+  },
+  "routes": [
+    { "pattern": "ihatehighways.wahdany.eu", "custom_domain": true }
+  ]
+}

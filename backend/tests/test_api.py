@@ -48,7 +48,9 @@ def test_plan_happy_path_matches_contract():
         "highway_distance_m",
         "highway_duration_s",
         "segments",
+        "gmaps_url",
     }
+    assert data["ride"]["gmaps_url"].startswith("https://www.google.com/maps/dir/?api=1")
     assert data["ride"]["segments"]
     for segment in data["ride"]["segments"]:
         assert set(segment) == {"kind", "encoded_polyline", "duration_s", "distance_m"}
@@ -109,3 +111,32 @@ def test_plan_origin_with_two_fields_rejected():
     with make_client() as client:
         resp = client.post("/api/plan", json=body)
     assert resp.status_code in (400, 422)
+
+
+def test_rate_limit_and_daily_cap():
+    from fastapi.testclient import TestClient
+
+    from app.config import Settings
+    from app.main import create_app
+
+    body = {
+        "origin": {"address": "Cologne"},
+        "destination": {"address": "Frankfurt"},
+        "max_extra_minutes": 15,
+    }
+    settings = Settings(_env_file=None, ihh_mock=True, rate_per_ip_hour=1, rate_daily_cap=100)
+    with TestClient(create_app(settings)) as client:
+        assert client.post("/api/plan", json=body).status_code == 200
+        # Identical request hits the response cache — never rate limited.
+        assert client.post("/api/plan", json=body).status_code == 200
+        other = dict(body, max_extra_minutes=30)
+        resp = client.post("/api/plan", json=other)
+        assert resp.status_code == 429
+        assert resp.json()["detail"]["code"] == "RATE_LIMITED"
+
+    settings = Settings(_env_file=None, ihh_mock=True, rate_per_ip_hour=10, rate_daily_cap=1)
+    with TestClient(create_app(settings)) as client:
+        assert client.post("/api/plan", json=body).status_code == 200
+        resp = client.post("/api/plan", json=dict(body, max_extra_minutes=30))
+        assert resp.status_code == 429
+        assert resp.json()["detail"]["code"] == "DAILY_CAP"

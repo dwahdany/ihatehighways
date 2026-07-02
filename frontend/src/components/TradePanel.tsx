@@ -32,6 +32,15 @@ export default function TradePanel({ plan }: TradePanelProps) {
 
       <RoadRibbon fastest={fastest} ride={ride} />
 
+      <a
+        className="btn-secondary"
+        href={ride.gmaps_url}
+        target="_blank"
+        rel="noopener noreferrer"
+      >
+        Open in Google Maps
+      </a>
+
       {detours.length > 0 ? (
         <DetourList detours={detours} />
       ) : fastest.highway_duration_s === 0 ? (

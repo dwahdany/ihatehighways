@@ -63,6 +63,8 @@ export interface Ride {
   highway_duration_s: number
   /** Ordered origin → destination; polylines concatenate into the full ride. */
   segments: RideSegment[]
+  /** Google Maps deep link reproducing this ride (detours pinned via waypoints). */
+  gmaps_url: string
 }
 
 export interface Detour {
@@ -82,7 +84,13 @@ export interface PlanResponse {
   detours: Detour[]
 }
 
-export type ApiErrorCode = 'INVALID_INPUT' | 'GEOCODE_FAILED' | 'NO_ROUTE' | 'UPSTREAM'
+export type ApiErrorCode =
+  | 'INVALID_INPUT'
+  | 'GEOCODE_FAILED'
+  | 'NO_ROUTE'
+  | 'UPSTREAM'
+  | 'RATE_LIMITED'
+  | 'DAILY_CAP'
 
 interface ErrorBody {
   detail?: {
