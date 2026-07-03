@@ -224,6 +224,7 @@ def build_chunks(
     settings: Settings,
     budget_s: float | None = None,
     chunk_km: float | None = None,
+    max_chunks: int | None = None,
 ) -> list[Chunk]:
     """Split highway stretches into detour-candidate chunks.
 
@@ -241,20 +242,26 @@ def build_chunks(
             parts.extend((sid, s, e) for s, e in _split_stretch(steps, a, b, max_m))
         return parts
 
+    cap = max_chunks if max_chunks is not None else settings.max_chunks
     chunk_m = chunk_km * 1000 if chunk_km is not None else chunk_size_m(settings, budget_s)
     parts = split_all(chunk_m)
-    for _ in range(40):
-        if len(parts) <= settings.max_chunks:
-            break
-        chunk_m *= 1.25
-        parts = split_all(chunk_m)
-    if len(parts) > settings.max_chunks:
+    # Enlarging chunks can never reduce the count below one part per stretch — when
+    # even that exceeds the cap, keep the requested chunk size and let the
+    # keep-longest trim below choose. Otherwise the x1.25 loop runs to absurdity and
+    # collapses whole stretches into single multi-hour "cuts".
+    if len(stretches) <= cap:
+        for _ in range(40):
+            if len(parts) <= cap:
+                break
+            chunk_m *= 1.25
+            parts = split_all(chunk_m)
+    if len(parts) > cap:
         # More stretches than allowed chunks even at one chunk per stretch:
         # keep the longest ones.
         def part_dist(p: tuple[int, int, int]) -> float:
             return sum(steps[i].distance_m for i in range(p[1], p[2]))
 
-        parts = sorted(parts, key=part_dist, reverse=True)[: settings.max_chunks]
+        parts = sorted(parts, key=part_dist, reverse=True)[:cap]
         parts.sort(key=lambda p: p[1])
 
     chunks: list[Chunk] = []

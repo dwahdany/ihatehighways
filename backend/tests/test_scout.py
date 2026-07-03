@@ -56,6 +56,80 @@ def test_scout_cut_pricing_is_composable():
         assert cut.road == "A3"
 
 
+def test_pick_by_scores_ranks_and_fails_open():
+    from app.planner import _pick_by_scores
+
+    # Known-bad corridors dropped; best known scores win the probe budget.
+    scores = [0.5, 10.0, 5.0, None, 8.0, 1.0]
+    assert _pick_by_scores(6, scores, max_probes=2, min_curvy_km=2.0) == [1, 4]
+    # All-unknown (Overpass down) degrades to even sampling along the route.
+    picked = _pick_by_scores(10, [None] * 10, max_probes=3, min_curvy_km=2.0)
+    assert len(picked) == 3
+    assert picked == sorted(picked)
+    assert picked[-1] - picked[0] >= 5  # spread, not the first three
+    # Under budget: everything eligible is probed, known-bad still dropped.
+    assert _pick_by_scores(3, [None, 5.0, 1.0], max_probes=12, min_curvy_km=2.0) == [0, 1]
+
+
+def test_scout_chunks_stay_small_on_long_routes():
+    from app.classify import build_chunks, classify_steps
+    from tests.test_classify import make_run
+
+    settings = Settings(_env_file=None)
+    # ~1000 km of motorway: with the old max_chunks=10 cap this ballooned to ~100 km
+    # chunks; the scout path must keep them at scout_chunk_km.
+    steps = make_run([(5_000, 115, "Continue on A24", "")] * 200)
+    flags = classify_steps(steps, settings)
+    chunks = build_chunks(
+        steps,
+        flags,
+        [1.0] * len(steps),
+        settings,
+        chunk_km=settings.scout_chunk_km,
+        max_chunks=settings.scout_max_raw_chunks,
+    )
+    assert len(chunks) == 40  # 1000 km / 25 km
+    assert all(c.distance_m <= settings.scout_chunk_km * 1000 for c in chunks)
+
+
+def test_scout_long_haul_caps_probes_and_chunk_sizes():
+    """End-to-end wiring: a ~500 km motorway must yield human-sized cuts capped at
+    scout_max_probes — not ten +70 min monsters (the Berlin->Calais regression)."""
+    from app.google_routes import GLeg, GRoute
+    from tests.test_classify import make_run
+
+    class LongHaulClient(MockRoutesClient):
+        async def compute_route(self, origin, destination, avoid_highways=False, origin_heading=None):
+            if avoid_highways:
+                return await super().compute_route(origin, destination, True, origin_heading)
+            steps = make_run(
+                [(5_000, 60, "Follow K7", "")]
+                + [(5_000, 115, "Continue on A7", "")] * 100
+                + [(5_000, 60, "Follow K7", "")]
+            )
+            static = sum(s.static_duration_s for s in steps)
+            dist = sum(s.distance_m for s in steps)
+            leg = GLeg(static, static, dist, steps)
+            pts: list = []
+            for s in steps:
+                pts.extend(polyline_util.decode(s.encoded_polyline))
+            return GRoute(static, static, dist, polyline_util.encode(pts), [leg])
+
+    req = ScoutRequest(
+        origin=PlacePoint(lat_lng=LatLng(lat=50.0, lng=7.0)),
+        destination=PlacePoint(address="far away"),
+    )
+    resp = asyncio.run(scout(req, LongHaulClient(), SETTINGS))
+    assert 0 < len(resp.cuts) <= SETTINGS.scout_max_probes
+    parts_by_cut = {p.cut_id: p for p in resp.skeleton if p.cut_id}
+    for cut in resp.cuts:
+        # Chunk sizes must stay near scout_chunk_km on any route length.
+        assert parts_by_cut[cut.id].distance_m <= SETTINGS.scout_chunk_km * 1000 * 1.1
+    # Probes spread along the haul, not clustered at the start.
+    firsts = [p.cut_id is not None for p in resp.skeleton]
+    assert any(firsts[len(firsts) // 2 :])
+
+
 def test_scout_api_contract():
     import os
 

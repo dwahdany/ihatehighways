@@ -408,7 +408,12 @@ async def _osm_filter(chunks: list[Chunk], settings: Settings) -> list[Chunk]:
     """Drop chunks whose corridors have no fun roads (free OSM data, fails open)."""
     if not chunks or not settings.osm_enabled or settings.ihh_mock:
         return chunks
-    scores = await osm.score_chunks([(c.entry, c.exit) for c in chunks], settings)
+    # /api/plan is interactive without a loader UI: flat ~12 s cap, unlike scout's
+    # batch-scaled deadline.
+    flat_deadline = settings.osm_deadline_s + settings.osm_deadline_per_batch_s
+    scores = await osm.score_chunks(
+        [(c.entry, c.exit) for c in chunks], settings, deadline_s=flat_deadline
+    )
     kept: list[Chunk] = []
     for chunk, score in zip(chunks, scores):
         if score is not None and score < settings.osm_min_curvy_km:
@@ -562,12 +567,52 @@ def _build_skeleton(
     ]
 
 
+def _pick_by_scores(
+    count: int, scores: Sequence[float | None], max_probes: int, min_curvy_km: float
+) -> list[int]:
+    """Choose which corridors get a paid Google probe, by OSM curvy score.
+
+    Known-bad corridors (score < threshold) are dropped; the rest are ranked by score.
+    Unknown scores (Overpass gaps) fail open and fill leftover probe slots evenly
+    spread along the route, so a dead Overpass degrades to uniform sampling.
+    """
+    eligible = [i for i in range(count) if scores[i] is None or scores[i] >= min_curvy_km]
+    if len(eligible) <= max_probes:
+        return eligible
+    known = sorted(
+        (i for i in eligible if scores[i] is not None), key=lambda i: -float(scores[i] or 0)
+    )
+    picked = set(known[:max_probes])
+    slots = max_probes - len(picked)
+    unknown = [i for i in eligible if scores[i] is None]
+    if slots > 0 and unknown:
+        stride = max(1, len(unknown) // slots)
+        picked.update(unknown[::stride][:slots])
+    return sorted(picked)
+
+
+async def _select_scout_chunks(chunks: list[Chunk], settings: Settings) -> list[Chunk]:
+    if not chunks:
+        return chunks
+    if settings.osm_enabled and not settings.ihh_mock:
+        scores = await osm.score_chunks([(c.entry, c.exit) for c in chunks], settings)
+    else:
+        scores = [None] * len(chunks)
+    indices = _pick_by_scores(
+        len(chunks), scores, settings.scout_max_probes, settings.osm_min_curvy_km
+    )
+    if len(indices) < len(chunks):
+        logger.info("scout: probing %d of %d corridors (OSM-ranked)", len(indices), len(chunks))
+    return [chunks[i] for i in indices]
+
+
 async def scout(req: ScoutRequest, client: RoutesClient, settings: Settings) -> ScoutResponse:
     """Evaluate ALL viable highway cuts so the rider composes the ride themselves.
 
-    Same pipeline as plan() but with fixed-size chunks and no knapsack: every gated
-    candidate is returned as a priced, toggleable cut; selection totals are additive
-    client-side (fastest.duration_s + Σ selected extra_duration_s).
+    Same pipeline as plan() but without a knapsack: every gated candidate is returned
+    as a priced, toggleable cut; selection totals are additive client-side
+    (fastest.duration_s + Σ selected extra_duration_s). Chunks stay human-sized on any
+    route length — OSM corridor scores decide which of them earn a paid probe.
     """
     base = await _fetch_base(req.origin, req.destination, client)
     steps, factors = _flatten(base)
@@ -575,10 +620,22 @@ async def scout(req: ScoutRequest, client: RoutesClient, settings: Settings) -> 
     flags = classify.classify_steps(steps, settings)
     fastest = _fastest_summary(base, steps, factors, flags)
 
-    chunks = classify.build_chunks(
-        steps, flags, factors, settings, chunk_km=settings.scout_chunk_km
+    stretches = classify.find_stretches(steps, flags, settings)
+    total_hw_km = (
+        sum(sum(steps[i].distance_m for i in range(a, b)) for a, b in stretches) / 1000.0
     )
-    chunks = await _osm_filter(chunks, settings)
+    # Chunk size only grows once even scout_max_raw_chunks corridors can't cover the
+    # highway — never balloons to +70 min cuts just because the route is long.
+    eff_chunk_km = max(settings.scout_chunk_km, total_hw_km / settings.scout_max_raw_chunks)
+    chunks = classify.build_chunks(
+        steps,
+        flags,
+        factors,
+        settings,
+        chunk_km=eff_chunk_km,
+        max_chunks=settings.scout_max_raw_chunks,
+    )
+    chunks = await _select_scout_chunks(chunks, settings)
     candidates = await _query_detours(chunks, client, settings)
     candidates = sorted(candidates, key=lambda c: c.chunk.step_start)
 

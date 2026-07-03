@@ -8,8 +8,11 @@ import MapView from './components/MapView'
 import PlaceField from './components/PlaceField'
 import type { PlaceSelection } from './components/PlaceField'
 import CutList from './components/CutList'
+import ScoutLoader from './components/ScoutLoader'
 import TradePanel from './components/TradePanel'
 import SetupCard from './components/SetupCard'
+
+const NOTHING_SELECTED: ReadonlySet<string> = new Set()
 
 const API_KEY: string | undefined = import.meta.env.VITE_GOOGLE_MAPS_API_KEY
 
@@ -99,6 +102,11 @@ function Planner({ apiKey }: { apiKey: string }) {
   }
 
   const ride = useMemo(() => (scout ? composeRide(scout, selected) : null), [scout, selected])
+  // The fastest route in ride order, so the ribbon's two bars share one legend.
+  const fastestSegments = useMemo(
+    () => (scout ? composeRide(scout, NOTHING_SELECTED).segments : []),
+    [scout],
+  )
   const gmapsUrl = useMemo(
     () => (scout ? buildGmapsUrl(scout, selected) : ''),
     [scout, selected],
@@ -135,17 +143,19 @@ function Planner({ apiKey }: { apiKey: string }) {
           </form>
 
           <div className="results" aria-live="polite">
-            {error && <div className="error-card">{error}</div>}
-            {!hasScouted && !scout && (
+            {loading && <ScoutLoader />}
+            {!loading && error && <div className="error-card">{error}</div>}
+            {!loading && !hasScouted && !scout && (
               <p className="empty-line">
                 Pick a start and an end. We&rsquo;ll find the highway worth cutting.
               </p>
             )}
-            {scout && ride && (
+            {!loading && scout && ride && (
               <>
                 <TradePanel
                   key={scoutKey}
                   fastest={scout.fastest}
+                  fastestSegments={fastestSegments}
                   ride={ride}
                   gmapsUrl={gmapsUrl}
                 />

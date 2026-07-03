@@ -36,14 +36,26 @@ def test_closed_and_short_ways_ignored():
     assert _way_excess_km(way(tiny)["geometry"]) is None  # < 300 m
 
 
-def test_score_ways_assigns_to_nearest_chunk():
+def test_score_ways_credits_chunks_by_bbox_overlap():
     pairs = [((50.0, 7.0), (50.0, 7.06)), ((51.0, 7.0), (51.0, 7.06))]
     near_first = way(zigzag())
     near_second = way([(51.0 + p[0] - 50.0, p[1]) for p in zigzag()])
-    scores = score_ways([near_first, near_second, way(straight())], pairs)
+    scores = score_ways([near_first, near_second, way(straight())], pairs, pad_m=4000)
     assert scores[0] > 0 and scores[1] > 0
-    # Same shape assigned once to each chunk (lengths differ ~1% with latitude).
+    # Same shape credited once to each chunk (lengths differ ~1% with latitude).
     assert abs(scores[0] - scores[1]) / scores[0] < 0.02
+
+
+def test_score_ways_boundary_way_counts_for_both_neighbors():
+    """Solo-query semantics under batching: a twisty cluster in the overlap band of
+    two adjacent corridors must score for BOTH, not be partitioned (which would drop
+    both below the probe gate)."""
+    a = ((50.0, 7.00), (50.0, 7.35))
+    b = ((50.0, 7.35), (50.0, 7.70))
+    boundary_way = way([(50.0 + 0.004 * math.sin(i * 1.8), 7.33 + 0.003 * i) for i in range(20)])
+    scores = score_ways([boundary_way], [a, b], pad_m=4000)
+    assert scores[0] > 0 and scores[1] > 0
+    assert scores[0] == scores[1]  # full credit to each, exactly like solo queries
 
 
 def test_bbox_pads_both_axes():

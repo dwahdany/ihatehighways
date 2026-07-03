@@ -1,5 +1,5 @@
 import type { FastestRoute } from '../api'
-import type { ComposedRide } from '../lib/compose'
+import type { ComposedRide, ComposedSegment } from '../lib/compose'
 import { formatDuration } from '../lib/format'
 
 interface RibbonSegment {
@@ -46,20 +46,20 @@ function Bar({ label, segments, totalS, highwayS, maxTotalS }: BarProps) {
 
 interface RoadRibbonProps {
   fastest: FastestRoute
+  /** The fastest route in ride order (skeleton with nothing selected), so both bars
+   * share one legend and are pixel-identical when no cuts are on. */
+  fastestSegments: ComposedSegment[]
   ride: ComposedRide
 }
 
 /** Two-bar comparison: fastest route vs your ride, segments ∝ duration. */
-export default function RoadRibbon({ fastest, ride }: RoadRibbonProps) {
+export default function RoadRibbon({ fastest, fastestSegments, ride }: RoadRibbonProps) {
   const maxTotalS = Math.max(fastest.duration_s, ride.duration_s, 1)
 
-  const fastestSegments: RibbonSegment[] = [
-    { className: 'seg-highway', duration_s: fastest.highway_duration_s },
-    {
-      className: 'seg-rest',
-      duration_s: Math.max(fastest.duration_s - fastest.highway_duration_s, 0),
-    },
-  ]
+  const upperSegments: RibbonSegment[] = fastestSegments.map((segment) => ({
+    className: `seg-${segment.kind}`,
+    duration_s: segment.duration_s,
+  }))
 
   const rideSegments: RibbonSegment[] = ride.segments.map((segment) => ({
     className: `seg-${segment.kind}`,
@@ -70,7 +70,7 @@ export default function RoadRibbon({ fastest, ride }: RoadRibbonProps) {
     <div className="ribbon">
       <Bar
         label="Fastest"
-        segments={fastestSegments}
+        segments={upperSegments}
         totalS={fastest.duration_s}
         highwayS={fastest.highway_duration_s}
         maxTotalS={maxTotalS}

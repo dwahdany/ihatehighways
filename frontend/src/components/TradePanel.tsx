@@ -1,15 +1,16 @@
 import type { FastestRoute } from '../api'
-import type { ComposedRide } from '../lib/compose'
+import type { ComposedRide, ComposedSegment } from '../lib/compose'
 import { formatSignedMinutes, minutes } from '../lib/format'
 import RoadRibbon from './RoadRibbon'
 
 interface TradePanelProps {
   fastest: FastestRoute
+  fastestSegments: ComposedSegment[]
   ride: ComposedRide
   gmapsUrl: string
 }
 
-export default function TradePanel({ fastest, ride, gmapsUrl }: TradePanelProps) {
+export default function TradePanel({ fastest, fastestSegments, ride, gmapsUrl }: TradePanelProps) {
   const avoidedHighwayS = Math.max(fastest.highway_duration_s - ride.highway_duration_s, 0)
 
   return (
@@ -31,7 +32,7 @@ export default function TradePanel({ fastest, ride, gmapsUrl }: TradePanelProps)
         </div>
       </div>
 
-      <RoadRibbon fastest={fastest} ride={ride} />
+      <RoadRibbon fastest={fastest} fastestSegments={fastestSegments} ride={ride} />
 
       <a className="btn-secondary" href={gmapsUrl} target="_blank" rel="noopener noreferrer">
         Open in Google Maps

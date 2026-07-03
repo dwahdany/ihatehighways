@@ -44,8 +44,14 @@ class Settings(BaseSettings):
     detour_extra_per_hw_km_s: float = 48.0
     # Fixed chunk size for /api/scout, where the rider composes cuts manually: fine
     # enough that single cuts stay in the +10-20 min range, coarse enough to keep the
-    # probe count (= paid Google calls) near the /api/plan level.
+    # probe count (= paid Google calls) near the /api/plan level. Chunks do NOT grow
+    # with route length — on long hauls OSM scoring picks which corridors get probed.
     scout_chunk_km: float = 25.0
+    # Paid Google detour probes per scout (the OSM ranking chooses which chunks).
+    scout_max_probes: int = 12
+    # Raw candidate corridors before OSM ranking; chunk size only grows beyond this
+    # (a 2000 km highway haul still yields 48 x ~42 km corridors, not 10 x 200 km).
+    scout_max_raw_chunks: int = 48
     # Reject paid detours that shed less highway time than this fraction of their cost.
     min_detour_efficiency: float = 0.5
     # A detour must shed at least this fraction of its chunk's highway time, or it never
@@ -62,10 +68,18 @@ class Settings(BaseSettings):
         "https://overpass.kumi.systems/api/interpreter"
     )
     osm_bbox_pad_m: float = 4000
+    # Chunk bboxes unioned into one Overpass query (bbox filters are cheap; batching
+    # keeps long routes at ~2 lanes x few queries instead of dozens). Measured: 3-bbox
+    # unions answer in ~6 s on a healthy instance; 6-bbox ones exceed a 10 s server
+    # timeout and fail wholesale.
+    osm_bbox_batch: int = 3
     osm_min_curvy_km: float = 2.0  # calibrated on real corridors, see docs/algorithm.md
-    osm_timeout_s: float = 10.0  # per query (server-side and client-side)
-    # Overall cap on how long OSM scoring may delay a plan. Unscored chunks fail open,
-    # so when Overpass is having a bad day we lose the filtering, not the plan.
-    osm_deadline_s: float = 12.0
+    osm_timeout_s: float = 15.0  # per query (server-side and client-side)
+    # How long OSM scoring may delay a scout: base + per-cold-batch, capped. Long cold
+    # routes wait longer (probe targeting matters most there; the UI shows a loader),
+    # warm ones barely wait. Unscored chunks fail open either way.
+    osm_deadline_s: float = 8.0
+    osm_deadline_per_batch_s: float = 4.0
+    osm_deadline_max_s: float = 30.0
     knapsack_bucket_s: int = 15
     cache_ttl_s: int = 240
