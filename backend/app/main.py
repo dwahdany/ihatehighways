@@ -13,8 +13,8 @@ from fastapi.responses import JSONResponse
 
 from .config import Settings
 from .google_routes import GoogleRoutesClient, MockRoutesClient
-from .models import PlanRequest, PlanResponse
-from .planner import PlanError, TTLCache, plan
+from .models import PlanRequest, PlanResponse, ScoutRequest, ScoutResponse
+from .planner import PlanError, TTLCache, plan, scout
 from .ratelimit import RateLimiter
 
 logger = logging.getLogger("ihatehighways.main")
@@ -73,12 +73,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def health() -> dict:
         return {"ok": True, "mock": settings.ihh_mock}
 
-    @app.post("/api/plan", response_model=PlanResponse)
-    async def plan_route(req: PlanRequest, request: Request) -> PlanResponse:
-        key = json.dumps(req.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
-        cached = cache.get(key)
-        if cached is not None:
-            return cached  # type: ignore[return-value]
+    def check_rate_limit(request: Request) -> None:
         # Cached hits are free; only uncached plans (which cost Google calls) count.
         denied = limiter.check(client_ip(request))
         if denied == "RATE_LIMITED":
@@ -97,8 +92,35 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "message": "Daily planning budget is used up. Back tomorrow.",
                 },
             )
+
+    @app.post("/api/plan", response_model=PlanResponse)
+    async def plan_route(req: PlanRequest, request: Request) -> PlanResponse:
+        key = json.dumps(req.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+        cached = cache.get(key)
+        if cached is not None:
+            return cached  # type: ignore[return-value]
+        check_rate_limit(request)
         try:
             result = await plan(req, client, settings)
+        except PlanError as exc:
+            raise HTTPException(
+                status_code=exc.status,
+                detail={"code": exc.code, "message": exc.message},
+            )
+        cache.set(key, result)
+        return result
+
+    @app.post("/api/scout", response_model=ScoutResponse)
+    async def scout_route(req: ScoutRequest, request: Request) -> ScoutResponse:
+        key = "scout:" + json.dumps(
+            req.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+        )
+        cached = cache.get(key)
+        if cached is not None:
+            return cached  # type: ignore[return-value]
+        check_rate_limit(request)
+        try:
+            result = await scout(req, client, settings)
         except PlanError as exc:
             raise HTTPException(
                 status_code=exc.status,

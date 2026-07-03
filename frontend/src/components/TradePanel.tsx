@@ -1,14 +1,15 @@
-import type { PlanResponse } from '../api'
+import type { FastestRoute } from '../api'
+import type { ComposedRide } from '../lib/compose'
 import { formatSignedMinutes, minutes } from '../lib/format'
 import RoadRibbon from './RoadRibbon'
-import DetourList from './DetourList'
 
 interface TradePanelProps {
-  plan: PlanResponse
+  fastest: FastestRoute
+  ride: ComposedRide
+  gmapsUrl: string
 }
 
-export default function TradePanel({ plan }: TradePanelProps) {
-  const { fastest, ride, detours } = plan
+export default function TradePanel({ fastest, ride, gmapsUrl }: TradePanelProps) {
   const avoidedHighwayS = Math.max(fastest.highway_duration_s - ride.highway_duration_s, 0)
 
   return (
@@ -32,22 +33,9 @@ export default function TradePanel({ plan }: TradePanelProps) {
 
       <RoadRibbon fastest={fastest} ride={ride} />
 
-      <a
-        className="btn-secondary"
-        href={ride.gmaps_url}
-        target="_blank"
-        rel="noopener noreferrer"
-      >
+      <a className="btn-secondary" href={gmapsUrl} target="_blank" rel="noopener noreferrer">
         Open in Google Maps
       </a>
-
-      {detours.length > 0 ? (
-        <DetourList detours={detours} />
-      ) : fastest.highway_duration_s === 0 ? (
-        <p className="note">No highway on the fastest route — enjoy.</p>
-      ) : (
-        <p className="note">No detour fits that budget here. Try +10 more minutes.</p>
-      )}
     </section>
   )
 }

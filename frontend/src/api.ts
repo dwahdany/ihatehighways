@@ -84,6 +84,48 @@ export interface PlanResponse {
   detours: Detour[]
 }
 
+export interface ScoutRequest {
+  origin: Waypoint
+  destination: Waypoint
+}
+
+/** One toggleable highway cut: a priced country-road replacement. */
+export interface Cut {
+  id: string
+  /** Motorway name from the instructions, e.g. "A3"; null when unknown. */
+  road: string | null
+  entry: LatLng
+  exit: LatLng
+  /** Midpoint of the detour path, for Google Maps waypoint pinning. */
+  mid: LatLng
+  encoded_polyline: string
+  detour_duration_s: number
+  detour_distance_m: number
+  /** vs staying on the highway; negative = the highway is jammed, cut is free. */
+  extra_duration_s: number
+  avoided_highway_s: number
+  avoided_highway_m: number
+  curviness: number
+}
+
+/** Fastest-route piece; parts with cut_id can be swapped for that cut. */
+export interface SkeletonPart {
+  kind: 'kept' | 'highway'
+  encoded_polyline: string
+  duration_s: number
+  distance_m: number
+  cut_id: string | null
+}
+
+export interface ScoutResponse {
+  origin: LatLng
+  destination: LatLng
+  fastest: FastestRoute
+  /** Ordered origin → destination; polylines concatenate into the fastest route. */
+  skeleton: SkeletonPart[]
+  cuts: Cut[]
+}
+
 export type ApiErrorCode =
   | 'INVALID_INPUT'
   | 'GEOCODE_FAILED'
@@ -125,10 +167,18 @@ export class ApiError extends Error {
 }
 
 export async function planRoute(req: PlanRequest): Promise<PlanResponse> {
-  const res = await fetch(`${API_BASE}/api/plan`, {
+  return request<PlanResponse>('/api/plan', req)
+}
+
+export async function scoutRoute(req: ScoutRequest): Promise<ScoutResponse> {
+  return request<ScoutResponse>('/api/scout', req)
+}
+
+async function request<T>(path: string, payload: unknown): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(req),
+    body: JSON.stringify(payload),
   })
   if (!res.ok) {
     let code: string = 'UPSTREAM'
@@ -147,5 +197,5 @@ export async function planRoute(req: PlanRequest): Promise<PlanResponse> {
     }
     throw new ApiError(res.status, code, message, enveloped, enveloped ? '' : raw)
   }
-  return (await res.json()) as PlanResponse
+  return (await res.json()) as T
 }

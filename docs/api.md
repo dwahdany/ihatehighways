@@ -84,6 +84,48 @@ Codes: `INVALID_INPUT`, `GEOCODE_FAILED`, `NO_ROUTE`, `UPSTREAM`, `RATE_LIMITED`
 `DAILY_CAP`. The two 429 codes carry rider-ready messages (per-IP hourly window and a
 global daily plan cap protecting the Google quota).
 
+## `POST /api/scout`
+
+The compose flow: evaluates ALL viable highway cuts (no budget, no knapsack) so the
+client lets the rider toggle them. Request = `origin`/`destination` only.
+
+Response `200`:
+
+```json
+{
+  "origin": { "lat": 50.937, "lng": 6.960 },
+  "destination": { "lat": 50.110, "lng": 8.682 },
+  "fastest": { "...": "same shape as /api/plan fastest" },
+  "skeleton": [
+    { "kind": "kept",    "encoded_polyline": "...", "duration_s": 640, "distance_m": 9000, "cut_id": null },
+    { "kind": "highway", "encoded_polyline": "...", "duration_s": 780, "distance_m": 23000, "cut_id": "c0" }
+  ],
+  "cuts": [
+    {
+      "id": "c0",
+      "road": "A3",
+      "entry": { "lat": 50.81, "lng": 7.15 },
+      "mid":   { "lat": 50.70, "lng": 7.40 },
+      "exit":  { "lat": 50.55, "lng": 7.61 },
+      "encoded_polyline": "...",
+      "detour_duration_s": 1860,
+      "detour_distance_m": 30000,
+      "extra_duration_s": 1080,
+      "avoided_highway_s": 660,
+      "avoided_highway_m": 17000,
+      "curviness": 1.319
+    }
+  ]
+}
+```
+
+Composition is client-side and additive: the ride = skeleton with each selected cut's
+part swapped for the cut; `ride_duration = fastest.duration_s + Σ selected
+extra_duration_s`. `extra_duration_s <= 0` means the highway is jammed — the cut is
+free. Skeleton polylines concatenate into the fastest route; every `cut_id` matches
+exactly one skeleton part (always `kind: "highway"`). Same error envelope and rate
+limits as `/api/plan`.
+
 ## `GET /api/health`
 
 ```json

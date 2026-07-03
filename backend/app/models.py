@@ -80,3 +80,43 @@ class PlanResponse(BaseModel):
     fastest: RouteSummary
     ride: Ride
     detours: list[DetourOut]
+
+
+class ScoutRequest(BaseModel):
+    origin: PlacePoint
+    destination: PlacePoint
+
+
+class CutOut(BaseModel):
+    """One toggleable highway cut: a priced country-road replacement."""
+
+    id: str
+    road: str | None  # motorway name extracted from instructions, e.g. "A3"
+    entry: LatLng
+    exit: LatLng
+    mid: LatLng  # midpoint of the detour path, for Google Maps waypoint pinning
+    encoded_polyline: str
+    detour_duration_s: int
+    detour_distance_m: int
+    extra_duration_s: int  # vs staying on the highway; negative = jammed, cut is free
+    avoided_highway_s: int
+    avoided_highway_m: int
+    curviness: float
+
+
+class SkeletonPart(BaseModel):
+    """Fastest-route piece; parts with cut_id can be swapped for that cut client-side."""
+
+    kind: Literal["kept", "highway"]
+    encoded_polyline: str
+    duration_s: int
+    distance_m: int
+    cut_id: str | None = None
+
+
+class ScoutResponse(BaseModel):
+    origin: LatLng  # resolved route endpoints, for client-side Google Maps handoff
+    destination: LatLng
+    fastest: RouteSummary
+    skeleton: list[SkeletonPart]
+    cuts: list[CutOut]

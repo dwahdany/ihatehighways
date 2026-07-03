@@ -17,6 +17,7 @@ from .classify import Chunk
 from .config import Settings
 from .google_routes import GRoute, GStep, NoRouteError, UpstreamError, WaypointSpec
 from .models import (
+    CutOut,
     DetourOut,
     LatLng,
     PlacePoint,
@@ -24,7 +25,10 @@ from .models import (
     PlanResponse,
     Ride,
     RouteSummary,
+    ScoutRequest,
+    ScoutResponse,
     Segment,
+    SkeletonPart,
 )
 from .polyline_util import Point
 
@@ -369,14 +373,11 @@ def _build_segments(
     ]
 
 
-async def plan(req: PlanRequest, client: RoutesClient, settings: Settings) -> PlanResponse:
-    budget_s = req.max_extra_minutes * 60
-
-    # 1. Base route (traffic-aware fastest).
+async def _fetch_base(
+    origin: PlacePoint, destination: PlacePoint, client: RoutesClient
+) -> GRoute:
     try:
-        base = await client.compute_route(
-            _spec(req.origin), _spec(req.destination), avoid_highways=False
-        )
+        return await client.compute_route(_spec(origin), _spec(destination), avoid_highways=False)
     except NoRouteError:
         raise PlanError("NO_ROUTE", "No route found between origin and destination.", 400)
     except UpstreamError as exc:
@@ -388,12 +389,12 @@ async def plan(req: PlanRequest, client: RoutesClient, settings: Settings) -> Pl
             )
         raise PlanError("UPSTREAM", exc.message, 502)
 
-    # 2. Atomize long steps, then classification and fastest-route stats.
-    steps, factors = _flatten(base)
-    steps, factors = classify.atomize_steps(steps, factors, settings.step_atom_m)
-    flags = classify.classify_steps(steps, settings)
+
+def _fastest_summary(
+    base: GRoute, steps: Sequence[GStep], factors: Sequence[float], flags: Sequence[bool]
+) -> RouteSummary:
     base_hw_s, base_hw_m = _highway_stats(steps, factors, flags)
-    fastest = RouteSummary(
+    return RouteSummary(
         encoded_polyline=base.encoded_polyline,
         duration_s=round(base.duration_s),
         static_duration_s=round(base.static_duration_s),
@@ -402,24 +403,43 @@ async def plan(req: PlanRequest, client: RoutesClient, settings: Settings) -> Pl
         highway_duration_s=round(base_hw_s),
     )
 
+
+async def _osm_filter(chunks: list[Chunk], settings: Settings) -> list[Chunk]:
+    """Drop chunks whose corridors have no fun roads (free OSM data, fails open)."""
+    if not chunks or not settings.osm_enabled or settings.ihh_mock:
+        return chunks
+    scores = await osm.score_chunks([(c.entry, c.exit) for c in chunks], settings)
+    kept: list[Chunk] = []
+    for chunk, score in zip(chunks, scores):
+        if score is not None and score < settings.osm_min_curvy_km:
+            logger.info(
+                "skipping chunk [%d,%d): corridor curvy score %.1f km < %.1f km",
+                chunk.step_start,
+                chunk.step_end,
+                score,
+                settings.osm_min_curvy_km,
+            )
+            continue
+        kept.append(chunk)
+    return kept
+
+
+async def plan(req: PlanRequest, client: RoutesClient, settings: Settings) -> PlanResponse:
+    budget_s = req.max_extra_minutes * 60
+
+    # 1. Base route (traffic-aware fastest).
+    base = await _fetch_base(req.origin, req.destination, client)
+
+    # 2. Atomize long steps, then classification and fastest-route stats.
+    steps, factors = _flatten(base)
+    steps, factors = classify.atomize_steps(steps, factors, settings.step_atom_m)
+    flags = classify.classify_steps(steps, settings)
+    fastest = _fastest_summary(base, steps, factors, flags)
+
     # 3-4. Stretches -> chunks (budget-adaptively sized) -> OSM pre-filter -> parallel
     # detour queries (each probe is a paid Google call; OSM gating is free).
     chunks = classify.build_chunks(steps, flags, factors, settings, budget_s=budget_s)
-    if chunks and settings.osm_enabled and not settings.ihh_mock:
-        scores = await osm.score_chunks([(c.entry, c.exit) for c in chunks], settings)
-        kept_chunks = []
-        for chunk, score in zip(chunks, scores):
-            if score is not None and score < settings.osm_min_curvy_km:
-                logger.info(
-                    "skipping chunk [%d,%d): corridor curvy score %.1f km < %.1f km",
-                    chunk.step_start,
-                    chunk.step_end,
-                    score,
-                    settings.osm_min_curvy_km,
-                )
-                continue
-            kept_chunks.append(chunk)
-        chunks = kept_chunks
+    chunks = await _osm_filter(chunks, settings)
     candidates = await _query_detours(chunks, client, settings)
 
     # 5. Selection: free detours always, then 0/1 knapsack within the budget.
@@ -486,3 +506,110 @@ async def plan(req: PlanRequest, client: RoutesClient, settings: Settings) -> Pl
         for s in spans
     ]
     return PlanResponse(budget_s=budget_s, fastest=fastest, ride=ride, detours=detours)
+
+
+def _build_skeleton(
+    steps: Sequence[GStep],
+    factors: Sequence[float],
+    flags: Sequence[bool],
+    candidates: Sequence[_Candidate],
+) -> list[SkeletonPart]:
+    """Fastest route split so every cut candidate owns exactly one highway part."""
+    by_start = {c.chunk.step_start: (f"c{i}", c) for i, c in enumerate(candidates)}
+    parts: list[list] = []  # [kind, points, duration, distance, cut_id]
+    i = 0
+    while i < len(steps):
+        hit = by_start.get(i)
+        if hit is not None:
+            cut_id, cand = hit
+            pts: list[Point] = []
+            duration = 0.0
+            distance = 0.0
+            for j in range(i, cand.chunk.step_end):
+                pts.extend(
+                    polyline_util.decode(steps[j].encoded_polyline)
+                    if steps[j].encoded_polyline
+                    else [steps[j].start, steps[j].end]
+                )
+                duration += steps[j].static_duration_s * factors[j]
+                distance += steps[j].distance_m
+            parts.append(["highway", pts, duration, distance, cut_id])
+            i = cand.chunk.step_end
+            continue
+        kind = "highway" if flags[i] else "kept"
+        pts = (
+            polyline_util.decode(steps[i].encoded_polyline)
+            if steps[i].encoded_polyline
+            else [steps[i].start, steps[i].end]
+        )
+        if parts and parts[-1][0] == kind and parts[-1][4] is None:
+            parts[-1][1].extend(pts)
+            parts[-1][2] += steps[i].static_duration_s * factors[i]
+            parts[-1][3] += steps[i].distance_m
+        else:
+            parts.append([kind, list(pts), steps[i].static_duration_s * factors[i], steps[i].distance_m, None])
+        i += 1
+
+    return [
+        SkeletonPart(
+            kind=kind,
+            encoded_polyline=polyline_util.encode(_dedupe(pts)),
+            duration_s=round(duration),
+            distance_m=round(distance),
+            cut_id=cut_id,
+        )
+        for kind, pts, duration, distance, cut_id in parts
+    ]
+
+
+async def scout(req: ScoutRequest, client: RoutesClient, settings: Settings) -> ScoutResponse:
+    """Evaluate ALL viable highway cuts so the rider composes the ride themselves.
+
+    Same pipeline as plan() but with fixed-size chunks and no knapsack: every gated
+    candidate is returned as a priced, toggleable cut; selection totals are additive
+    client-side (fastest.duration_s + Σ selected extra_duration_s).
+    """
+    base = await _fetch_base(req.origin, req.destination, client)
+    steps, factors = _flatten(base)
+    steps, factors = classify.atomize_steps(steps, factors, settings.step_atom_m)
+    flags = classify.classify_steps(steps, settings)
+    fastest = _fastest_summary(base, steps, factors, flags)
+
+    chunks = classify.build_chunks(
+        steps, flags, factors, settings, chunk_km=settings.scout_chunk_km
+    )
+    chunks = await _osm_filter(chunks, settings)
+    candidates = await _query_detours(chunks, client, settings)
+    candidates = sorted(candidates, key=lambda c: c.chunk.step_start)
+
+    skeleton = _build_skeleton(steps, factors, flags, candidates)
+    cuts = []
+    for i, c in enumerate(candidates):
+        mid = c.chunk.entry
+        if c.route.encoded_polyline:
+            mid = polyline_util.point_at_fraction(
+                polyline_util.decode(c.route.encoded_polyline), 0.5
+            )
+        cuts.append(
+            CutOut(
+                id=f"c{i}",
+                road=classify.road_name(steps, c.chunk.step_start, c.chunk.step_end),
+                entry=LatLng(lat=c.chunk.entry[0], lng=c.chunk.entry[1]),
+                exit=LatLng(lat=c.chunk.exit[0], lng=c.chunk.exit[1]),
+                mid=LatLng(lat=mid[0], lng=mid[1]),
+                encoded_polyline=c.route.encoded_polyline,
+                detour_duration_s=round(c.route.duration_s),
+                detour_distance_m=round(c.route.distance_m),
+                extra_duration_s=round(c.extra_cost_s),
+                avoided_highway_s=round(c.value_s),
+                avoided_highway_m=round(c.chunk.distance_m - c.hw_in_detour_m),
+                curviness=round(_curviness(c.route, c.chunk.entry, c.chunk.exit), 3),
+            )
+        )
+    return ScoutResponse(
+        origin=LatLng(lat=steps[0].start[0], lng=steps[0].start[1]),
+        destination=LatLng(lat=steps[-1].end[0], lng=steps[-1].end[1]),
+        fastest=fastest,
+        skeleton=skeleton,
+        cuts=cuts,
+    )

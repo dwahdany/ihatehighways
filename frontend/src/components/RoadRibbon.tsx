@@ -1,4 +1,5 @@
-import type { FastestRoute, Ride } from '../api'
+import type { FastestRoute } from '../api'
+import type { ComposedRide } from '../lib/compose'
 import { formatDuration } from '../lib/format'
 
 interface RibbonSegment {
@@ -45,7 +46,7 @@ function Bar({ label, segments, totalS, highwayS, maxTotalS }: BarProps) {
 
 interface RoadRibbonProps {
   fastest: FastestRoute
-  ride: Ride
+  ride: ComposedRide
 }
 
 /** Two-bar comparison: fastest route vs your ride, segments ∝ duration. */

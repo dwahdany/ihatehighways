@@ -1,12 +1,14 @@
 import { Map } from '@vis.gl/react-google-maps'
-import type { PlanResponse } from '../api'
+import type { ScoutResponse } from '../api'
 import RouteLayer from './RouteLayer'
 
 interface MapViewProps {
-  plan: PlanResponse | null
+  scout: ScoutResponse | null
+  selected: ReadonlySet<string>
+  onToggle: (id: string) => void
 }
 
-export default function MapView({ plan }: MapViewProps) {
+export default function MapView({ scout, selected, onToggle }: MapViewProps) {
   return (
     <div className="map">
       <Map
@@ -17,7 +19,7 @@ export default function MapView({ plan }: MapViewProps) {
         gestureHandling="greedy"
         disableDefaultUI
       >
-        {plan && <RouteLayer plan={plan} />}
+        {scout && <RouteLayer scout={scout} selected={selected} onToggle={onToggle} />}
       </Map>
     </div>
   )

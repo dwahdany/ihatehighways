@@ -42,6 +42,10 @@ class Settings(BaseSettings):
     # so a single detour roughly fits the rider's budget (see docs/algorithm.md).
     # Calibrated on real Cologne->Frankfurt data (measured 43-72 s per highway km).
     detour_extra_per_hw_km_s: float = 48.0
+    # Fixed chunk size for /api/scout, where the rider composes cuts manually: fine
+    # enough that single cuts stay in the +10-20 min range, coarse enough to keep the
+    # probe count (= paid Google calls) near the /api/plan level.
+    scout_chunk_km: float = 25.0
     # Reject paid detours that shed less highway time than this fraction of their cost.
     min_detour_efficiency: float = 0.5
     # A detour must shed at least this fraction of its chunk's highway time, or it never

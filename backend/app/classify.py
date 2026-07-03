@@ -206,12 +206,24 @@ def chunk_size_m(settings: Settings, budget_s: float | None) -> float:
     return chunk_km * 1000
 
 
+def road_name(steps: Sequence[GStep], start: int, end: int) -> str | None:
+    """Most common motorway name in the instruction texts of steps [start, end)."""
+    counts: dict[str, int] = {}
+    for i in range(start, end):
+        m = MOTORWAY_RE.search(steps[i].instructions or "")
+        if m:
+            name = m.group(0).replace(" ", "").upper()
+            counts[name] = counts.get(name, 0) + 1
+    return max(counts, key=lambda k: counts[k]) if counts else None
+
+
 def build_chunks(
     steps: Sequence[GStep],
     flags: Sequence[bool],
     factors: Sequence[float],
     settings: Settings,
     budget_s: float | None = None,
+    chunk_km: float | None = None,
 ) -> list[Chunk]:
     """Split highway stretches into detour-candidate chunks.
 
@@ -229,7 +241,7 @@ def build_chunks(
             parts.extend((sid, s, e) for s, e in _split_stretch(steps, a, b, max_m))
         return parts
 
-    chunk_m = chunk_size_m(settings, budget_s)
+    chunk_m = chunk_km * 1000 if chunk_km is not None else chunk_size_m(settings, budget_s)
     parts = split_all(chunk_m)
     for _ in range(40):
         if len(parts) <= settings.max_chunks:
