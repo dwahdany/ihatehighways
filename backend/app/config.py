@@ -80,6 +80,10 @@ class Settings(BaseSettings):
     # warm ones barely wait. Unscored chunks fail open either way.
     osm_deadline_s: float = 8.0
     osm_deadline_per_batch_s: float = 4.0
-    osm_deadline_max_s: float = 30.0
+    # Hard UX cap: partially-scored scouts probe with what they have (unknowns fill
+    # probe slots evenly) rather than stalling for straggler batches; the cache warms
+    # a bit more with every scout anyway. Observed: waiting out a 28 s deadline for
+    # the last 3 batches bought nothing the even-spread fallback wouldn't.
+    osm_deadline_max_s: float = 18.0
     knapsack_bucket_s: int = 15
     cache_ttl_s: int = 240
