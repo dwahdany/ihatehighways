@@ -70,9 +70,13 @@ least time to replace — and traffic jams make some replacements *free*.
      highway time. Soft `avoidHighways` between two mid-motorway points often returns the
      motorway itself (observed on real A3 data) — and leg-average traffic scaling can even
      make such non-escapes look *free*. This gate also applies to merged-span requeries.
-   - **Efficiency gate:** paid detours with `value < MIN_DETOUR_EFFICIENCY (0.5) × extra_cost`
-     are discarded — never pay 9 minutes of city crawling to shed 3 minutes of urban motorway.
-     Free (jam) detours are exempt from the efficiency gate, never from the escape gate.
+   - **Worth gate:** each probe requests up to 3 route alternatives (same billable call) and
+     keeps the alternative maximizing `worth = value × (1 + CURVY_BOOST (2.0) ×
+     (min(curviness, CURVINESS_CAP 1.7) − 1)) / extra_cost` — curviness is valued against time
+     loss, so a 1.5×-curvy sweep justifies roughly 3× the time cost of an arrow-straight swap.
+     Candidates below `MIN_DETOUR_WORTH` (0.6) are discarded; free (jam) detours have infinite
+     worth but are never exempt from the escape gate. The same worth formula drives the
+     frontend's "Good deals" preset (≥ 1.0) and the cut-list ranking.
 
    **Known estimation limit:** chunk baselines scale step static durations by the *leg-wide*
    traffic factor, so per-chunk costs carry ±jam-distribution error. Fixing this properly

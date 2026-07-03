@@ -1,4 +1,5 @@
 import type { Cut } from '../api'
+import { cutWorth } from '../lib/compose'
 import { formatKm, formatSignedMinutes, minutes } from '../lib/format'
 
 interface CutListProps {
@@ -7,11 +8,13 @@ interface CutListProps {
   onToggle: (id: string) => void
 }
 
-/** The menu of highway cuts: each row is a priced, toggleable trade. */
+/** The menu of highway cuts, best trades first (worth = curviness-boosted highway
+ * time shed per extra minute; the map stays spatial, the list is the ranking). */
 export default function CutList({ cuts, selected, onToggle }: CutListProps) {
+  const ranked = [...cuts].sort((a, b) => cutWorth(b) - cutWorth(a))
   return (
     <ul className="cut-list">
-      {cuts.map((cut) => {
+      {ranked.map((cut) => {
         const on = selected.has(cut.id)
         const free = cut.extra_duration_s <= 0
         return (

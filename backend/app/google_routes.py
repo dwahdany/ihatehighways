@@ -178,6 +178,27 @@ class GoogleRoutesClient:
         avoid_highways: bool = False,
         origin_heading: int | None = None,
     ) -> GRoute:
+        routes = await self._request(origin, destination, avoid_highways, origin_heading, False)
+        return routes[0]
+
+    async def compute_route_alternatives(
+        self,
+        origin: WaypointSpec,
+        destination: WaypointSpec,
+        avoid_highways: bool = False,
+        origin_heading: int | None = None,
+    ) -> list[GRoute]:
+        """Up to 3 route alternatives — same billable request, more candidates to score."""
+        return await self._request(origin, destination, avoid_highways, origin_heading, True)
+
+    async def _request(
+        self,
+        origin: WaypointSpec,
+        destination: WaypointSpec,
+        avoid_highways: bool,
+        origin_heading: int | None,
+        alternatives: bool,
+    ) -> list[GRoute]:
         body = {
             "origin": origin.to_json(heading=origin_heading),
             "destination": destination.to_json(),
@@ -190,6 +211,9 @@ class GoogleRoutesClient:
             "units": "METRIC",
             # NEVER set departureTime: omitted means "now"; a past timestamp errors.
         }
+        if alternatives:
+            # Not allowed with intermediates (we never send any); one billable request.
+            body["computeAlternativeRoutes"] = True
         headers = {
             "Content-Type": "application/json",
             "X-Goog-Api-Key": self._api_key,
@@ -210,7 +234,7 @@ class GoogleRoutesClient:
         raise UpstreamError(502, "Routes API unavailable")  # pragma: no cover
 
     @staticmethod
-    def _handle_response(resp: httpx.Response) -> GRoute:
+    def _handle_response(resp: httpx.Response) -> list[GRoute]:
         try:
             data = resp.json()
         except ValueError:
@@ -223,7 +247,7 @@ class GoogleRoutesClient:
         routes = data.get("routes") or []
         if not routes:
             raise NoRouteError("Routes API returned no routes")
-        return _parse_route(routes[0])
+        return [_parse_route(r) for r in routes]
 
 
 # ---------------------------------------------------------------------------
@@ -315,10 +339,27 @@ class MockRoutesClient:
         if avoid_highways:
             p1 = origin.lat_lng or _COLOGNE
             p2 = destination.lat_lng or _FRANKFURT
-            return self._detour_route(p1, p2)
+            return self._detour_route(p1, p2, _DETOUR_OFFSET_FRACTION, _DETOUR_KMH)
         if self._base is None:
             self._base = self._build_base()
         return self._base
+
+    async def compute_route_alternatives(
+        self,
+        origin: WaypointSpec,
+        destination: WaypointSpec,
+        avoid_highways: bool = False,
+        origin_heading: int | None = None,
+    ) -> list[GRoute]:
+        """Two deterministic alternatives: the standard arc and a curvier, slower one."""
+        p1 = origin.lat_lng or _COLOGNE
+        p2 = destination.lat_lng or _FRANKFURT
+        if not avoid_highways:
+            return [await self.compute_route(origin, destination, False, origin_heading)]
+        return [
+            self._detour_route(p1, p2, _DETOUR_OFFSET_FRACTION, _DETOUR_KMH),
+            self._detour_route(p1, p2, _DETOUR_OFFSET_FRACTION * 2, _DETOUR_KMH - 7),
+        ]
 
     @staticmethod
     def _build_base() -> GRoute:
@@ -365,7 +406,9 @@ class MockRoutesClient:
         )
 
     @staticmethod
-    def _detour_route(p1: Point, p2: Point) -> GRoute:
+    def _detour_route(
+        p1: Point, p2: Point, offset_fraction: float = _DETOUR_OFFSET_FRACTION, kmh: float = _DETOUR_KMH
+    ) -> GRoute:
         dist = polyline_util.haversine_m(p1, p2)
         if dist < 1.0:
             pts = [p1, p2]
@@ -378,9 +421,9 @@ class MockRoutesClient:
             norm = math.hypot(x2, y2) or 1.0
             nx, ny = -y2 / norm, x2 / norm  # unit perpendicular (left of travel)
             # Quadratic bezier control point so the curve midpoint sits at
-            # chord midpoint + 15% of distance, perpendicular.
-            cx = x2 / 2 + 2 * _DETOUR_OFFSET_FRACTION * dist * nx
-            cy = y2 / 2 + 2 * _DETOUR_OFFSET_FRACTION * dist * ny
+            # chord midpoint + offset_fraction of distance, perpendicular.
+            cx = x2 / 2 + 2 * offset_fraction * dist * nx
+            cy = y2 / 2 + 2 * offset_fraction * dist * ny
             pts = []
             n = 24
             for i in range(n + 1):
@@ -389,7 +432,7 @@ class MockRoutesClient:
                 by = 2 * t * (1 - t) * cy + t * t * y2
                 pts.append((p1[0] + by / ky, p1[1] + bx / kx))
         length = polyline_util.path_length_m(pts)
-        static = length / (_DETOUR_KMH / 3.6)
+        static = length / (kmh / 3.6)
         encoded = polyline_util.encode(pts)
         step = GStep(
             distance_m=round(length),

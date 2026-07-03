@@ -70,8 +70,9 @@ def test_zero_budget_only_free_detours():
     assert resp.ride.duration_s <= resp.fastest.duration_s + 1
 
 
-def test_efficiency_gate_rejects_junk_detours():
-    """A paid detour that sheds little highway time relative to its cost is skipped."""
+def test_worth_gate_rejects_junk_detours():
+    """A paid, nearly-straight detour that sheds little highway time relative to its
+    cost is skipped (curviness ~1.12 doesn't buy enough boost)."""
     from app.classify import Chunk
     from app.google_routes import GLeg, GRoute, GStep
     from app.planner import _query_detours
@@ -112,7 +113,80 @@ def test_efficiency_gate_rejects_junk_detours():
         entry_heading=0,
     )
     candidates = asyncio.run(_query_detours([chunk], JunkDetourClient(), SETTINGS))
-    assert candidates == []  # value ~318 s vs cost 700 s -> gated
+    assert candidates == []  # worth ~0.57 < 0.6 -> gated
+
+
+def test_worth_values_curviness_against_time_loss():
+    from app.planner import _worth
+
+    # Same shed/cost ratio: the curvy detour is worth ~2x the straight one.
+    straight = _worth(300, 600, 1.0, SETTINGS)
+    curvy = _worth(300, 600, 1.5, SETTINGS)
+    assert straight == 0.5
+    assert curvy == 1.0
+    # Curviness credit is capped (urban grid wiggle can't buy infinite tolerance).
+    assert _worth(300, 600, 3.0, SETTINGS) == _worth(300, 600, SETTINGS.curviness_cap, SETTINGS)
+    # Free (jammed) detours are always worth it.
+    assert _worth(10, 0, 1.0, SETTINGS) == float("inf")
+    assert _worth(10, -50, 1.0, SETTINGS) == float("inf")
+
+
+def test_probe_picks_highest_worth_alternative():
+    """Among route alternatives from one paid call, the curvier one wins when its
+    extra time is justified."""
+    import asyncio as aio
+
+    from app.classify import Chunk
+    from app.google_routes import GLeg, GRoute, GStep
+    from app.planner import _probe_span
+
+    def route(distance_m: float, duration_s: float, points: list) -> GRoute:
+        step = GStep(
+            distance_m=distance_m,
+            static_duration_s=duration_s,
+            encoded_polyline=polyline_util.encode(points),
+            maneuver="",
+            instructions="Follow the country roads",
+            start=points[0],
+            end=points[-1],
+        )
+        leg = GLeg(duration_s, duration_s, distance_m, [step])
+        return GRoute(duration_s, duration_s, distance_m, step.encoded_polyline, [leg])
+
+    entry, exit_ = (50.0, 7.0), (50.18, 7.0)  # ~20 km chord
+    straightish = route(22_000, 1300.0, [entry, (50.09, 7.02), exit_])
+    curvy_points = [(50.0 + 0.18 * i / 12, 7.0 + 0.02 * ((-1) ** i)) for i in range(13)]
+    curvy_points[0], curvy_points[-1] = entry, exit_
+    curvy = route(30_000, 1800.0, curvy_points)
+
+    class TwoAlternativesClient:
+        async def compute_route_alternatives(self, origin, destination, avoid_highways=False, origin_heading=None):
+            return [straightish, curvy]
+
+    chunk = Chunk(
+        stretch_id=0,
+        step_start=0,
+        step_end=2,
+        distance_m=20_000,
+        static_duration_s=650.0,
+        baseline_s=650.0,
+        entry=entry,
+        exit=exit_,
+        entry_heading=0,
+    )
+    probes: list[bool] = []
+    best = aio.run(
+        _probe_span(
+            chunk,
+            TwoAlternativesClient(),
+            SETTINGS,
+            aio.Semaphore(2),
+            on_probe=lambda route_, kept: probes.append(kept),
+        )
+    )
+    assert best is not None
+    assert best.route is curvy  # higher worth despite +500 s more cost
+    assert probes.count(True) == 1 and probes.count(False) == 1
 
 
 def test_escape_gate_rejects_detour_that_stays_on_the_motorway():

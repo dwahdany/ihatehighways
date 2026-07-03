@@ -103,6 +103,7 @@ class _Candidate:
     value_s: float  # baseline highway time - highway time within the detour
     hw_in_detour_s: float
     hw_in_detour_m: float
+    curviness: float  # detour path length / straight line (sinuosity)
 
 
 @dataclass(frozen=True)
@@ -176,15 +177,27 @@ async def _probe_span(
     on_candidate: Callable[[_Candidate], None] | None = None,
     on_probe: Callable[[GRoute, bool], None] | None = None,
 ) -> _Candidate | None:
-    """Probe one (possibly merged) corridor: paid Google query + gates."""
+    """Probe one (possibly merged) corridor: one paid Google query, up to 3 route
+    alternatives evaluated, the highest-worth survivor wins."""
+    alternatives_fn = getattr(client, "compute_route_alternatives", None)
     async with semaphore:
         try:
-            route = await client.compute_route(
-                WaypointSpec(lat_lng=chunk.entry),
-                WaypointSpec(lat_lng=chunk.exit),
-                avoid_highways=True,
-                origin_heading=chunk.entry_heading,
-            )
+            if alternatives_fn is not None:
+                routes = await alternatives_fn(
+                    WaypointSpec(lat_lng=chunk.entry),
+                    WaypointSpec(lat_lng=chunk.exit),
+                    avoid_highways=True,
+                    origin_heading=chunk.entry_heading,
+                )
+            else:  # simple test stubs only implement compute_route
+                routes = [
+                    await client.compute_route(
+                        WaypointSpec(lat_lng=chunk.entry),
+                        WaypointSpec(lat_lng=chunk.exit),
+                        avoid_highways=True,
+                        origin_heading=chunk.entry_heading,
+                    )
+                ]
         except Exception as exc:  # query failure -> skip chunk, log, continue
             logger.warning(
                 "detour query failed for steps [%d,%d): %s",
@@ -193,12 +206,31 @@ async def _probe_span(
                 exc,
             )
             return None
-    candidate = _evaluate_probe(chunk, route, settings)
+    evaluated = [(route, _evaluate_probe(chunk, route, settings)) for route in routes]
+    passing = [cand for _, cand in evaluated if cand is not None]
+    best = (
+        max(passing, key=lambda c: _worth(c.value_s, c.extra_cost_s, c.curviness, settings))
+        if passing
+        else None
+    )
     if on_probe is not None:
-        on_probe(route, candidate is not None)
-    if candidate is not None and on_candidate is not None:
-        on_candidate(candidate)
-    return candidate
+        for route, cand in evaluated:
+            on_probe(route, cand is best and best is not None)
+    if best is not None and on_candidate is not None:
+        on_candidate(best)
+    return best
+
+
+def _worth(value_s: float, extra_cost_s: float, curviness: float, settings: Settings) -> float:
+    """Fun-per-second-paid: highway time shed, boosted by curviness, per extra second.
+
+    A 1.5x-curvy sweep justifies more time loss than an arrow-straight B-road; free
+    (jammed-highway) detours are infinitely worth it.
+    """
+    if extra_cost_s <= 0:
+        return float("inf")
+    boost = 1 + settings.curvy_boost * (min(curviness, settings.curviness_cap) - 1.0)
+    return value_s * boost / extra_cost_s
 
 
 def _evaluate_probe(chunk: Chunk, route: GRoute, settings: Settings) -> _Candidate | None:
@@ -224,14 +256,18 @@ def _evaluate_probe(chunk: Chunk, route: GRoute, settings: Settings) -> _Candida
             chunk.baseline_s,
         )
         return None
-    # Efficiency gate: a paid detour must shed highway time worth a reasonable
-    # fraction of its cost, or it is a junk trade (e.g. crawling through city
-    # streets to dodge an urban motorway).
-    if extra_cost_s > 0 and value_s < settings.min_detour_efficiency * extra_cost_s:
+    curviness = _curviness(route, chunk.entry, chunk.exit)
+    # Worth gate: the fun bought (curviness-boosted highway time shed) must justify
+    # the minutes paid — a straight boring swap fails where a twisty one passes.
+    worth = _worth(value_s, extra_cost_s, curviness, settings)
+    if worth < settings.min_detour_worth:
         logger.info(
-            "skipping detour: pays %.0f s to avoid only %.0f s of highway",
+            "skipping detour: worth %.2f < %.2f (pays %.0f s, sheds %.0f s at curv %.2f)",
+            worth,
+            settings.min_detour_worth,
             extra_cost_s,
             value_s,
+            curviness,
         )
         return None
     return _Candidate(
@@ -241,6 +277,7 @@ def _evaluate_probe(chunk: Chunk, route: GRoute, settings: Settings) -> _Candida
         value_s=value_s,
         hw_in_detour_s=hw_s,
         hw_in_detour_m=hw_m,
+        curviness=curviness,
     )
 
 
@@ -781,7 +818,7 @@ def _cut_fields(c: _Candidate, steps: Sequence[GStep]) -> dict:
         "extra_duration_s": round(c.extra_cost_s),
         "avoided_highway_s": round(c.value_s),
         "avoided_highway_m": round(c.chunk.distance_m - c.hw_in_detour_m),
-        "curviness": round(_curviness(c.route, c.chunk.entry, c.chunk.exit), 3),
+        "curviness": round(c.curviness, 3),
     }
 
 

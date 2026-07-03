@@ -72,9 +72,23 @@ export function composeRide(scout: ScoutResponse, selected: ReadonlySet<string>)
   }
 }
 
-/** A cut is a "good deal" when free (jammed highway) or near time-parity for its value. */
+// Mirrors the backend's worth gate constants (config.py: curvy_boost, curviness_cap).
+const CURVY_BOOST = 2.0
+const CURVINESS_CAP = 1.7
+
+/**
+ * Fun-per-second-paid: highway time shed, boosted by curviness, per extra second.
+ * A 1.5×-curvy sweep justifies more time loss than an arrow-straight B-road.
+ */
+export function cutWorth(cut: Cut): number {
+  if (cut.extra_duration_s <= 0) return Number.POSITIVE_INFINITY
+  const boost = 1 + CURVY_BOOST * (Math.min(cut.curviness, CURVINESS_CAP) - 1)
+  return (cut.avoided_highway_s * boost) / cut.extra_duration_s
+}
+
+/** A cut is a "good deal" when free (jammed highway) or its worth clears 1.0. */
 function isGoodDeal(cut: Cut): boolean {
-  return cut.extra_duration_s <= 0 || cut.avoided_highway_s >= 0.8 * cut.extra_duration_s
+  return cutWorth(cut) >= 1.0
 }
 
 export function presetSelection(

@@ -56,8 +56,13 @@ class Settings(BaseSettings):
     # Raw candidate corridors before OSM ranking; chunk size only grows beyond this
     # (a 2000 km highway haul still yields 48 x ~42 km corridors, not 10 x 200 km).
     scout_max_raw_chunks: int = 48
-    # Reject paid detours that shed less highway time than this fraction of their cost.
-    min_detour_efficiency: float = 0.5
+    # Worth gate: fun-per-second — highway time shed, boosted by curviness, per extra
+    # second paid. Arrow-straight detours (boost 1.0) face a strict bar while a
+    # 1.5x-curvy sweep passes at roughly a third of the shed-to-cost ratio.
+    min_detour_worth: float = 0.6
+    curvy_boost: float = 2.0
+    # Urban grid wiggle inflates sinuosity; cap how much credit curviness can earn.
+    curviness_cap: float = 1.7
     # A detour must shed at least this fraction of its chunk's highway time, or it never
     # really left the motorway (soft avoidHighways stays on it when leaving is costly).
     min_avoided_fraction: float = 0.5
