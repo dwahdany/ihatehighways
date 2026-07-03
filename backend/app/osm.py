@@ -254,10 +254,23 @@ async def score_chunks(
         # fail open and get cached by a later scout.
         first_stage = min(deadline, settings.osm_deadline_s)
         _, pending = await asyncio.wait(tasks, timeout=first_stage)
-        # Early-exit is scout-only (deadline_s None): callers with an explicit flat
-        # deadline (/api/plan's cost filter) want complete scores within their cap.
-        if pending and (deadline_s is not None or len(scored) < 0.7 * len(misses)):
-            _, pending = await asyncio.wait(pending, timeout=deadline - first_stage)
+        if pending:
+            # Second stage policy: callers with an explicit flat deadline (/api/plan's
+            # cost filter) always get their full cap. The scout path adapts: mostly
+            # scored -> proceed now; partially scored -> wait the scaled deadline;
+            # NOTHING scored -> the mirrors are likely throttled (observed from
+            # Render's shared egress IP), so one short grace wait, then fail open
+            # instead of stalling the loader for the whole 30 s cap.
+            if deadline_s is not None:
+                remaining = deadline - first_stage
+            elif not scored:
+                remaining = min(deadline - first_stage, settings.osm_deadline_per_batch_s * 2)
+            elif len(scored) < 0.7 * len(misses):
+                remaining = deadline - first_stage
+            else:
+                remaining = 0.0
+            if remaining > 0:
+                _, pending = await asyncio.wait(pending, timeout=remaining)
         for task in pending:
             task.cancel()
         if pending:

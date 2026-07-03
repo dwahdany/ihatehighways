@@ -19,6 +19,10 @@ from .ratelimit import RateLimiter
 
 logger = logging.getLogger("ihatehighways.main")
 
+# uvicorn only configures its own loggers; without a root handler the app's INFO lines
+# (Overpass mirror failures, OSM gating decisions) are invisible in production logs.
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings()
