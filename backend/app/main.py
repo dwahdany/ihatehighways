@@ -9,12 +9,12 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from .config import Settings
 from .google_routes import GoogleRoutesClient, MockRoutesClient
 from .models import PlanRequest, PlanResponse, ScoutRequest, ScoutResponse
-from .planner import PlanError, TTLCache, plan, scout
+from .planner import PlanError, TTLCache, plan, scout, scout_events
 from .ratelimit import RateLimiter
 
 logger = logging.getLogger("ihatehighways.main")
@@ -128,6 +128,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         cache.set(key, result)
         return result
+
+    @app.post("/api/scout/stream")
+    async def scout_route_stream(req: ScoutRequest, request: Request) -> StreamingResponse:
+        """NDJSON progress stream: route -> corridors -> scored* -> probing -> cut* ->
+        done|error. Shares cache and rate limits with /api/scout."""
+        key = "scout:" + json.dumps(
+            req.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+        )
+        headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+        cached = cache.get(key)
+        if cached is not None:
+
+            async def replay():
+                payload = cached.model_dump(mode="json")  # type: ignore[union-attr]
+                yield json.dumps({"type": "done", "scout": payload}) + "\n"
+
+            return StreamingResponse(
+                replay(), media_type="application/x-ndjson", headers=headers
+            )
+        check_rate_limit(request)
+
+        async def stream():
+            async for event in scout_events(req, client, settings):
+                if event["type"] == "done":
+                    cache.set(key, ScoutResponse.model_validate(event["scout"]))
+                yield json.dumps(event, separators=(",", ":")) + "\n"
+
+        return StreamingResponse(stream(), media_type="application/x-ndjson", headers=headers)
 
     return app
 

@@ -820,3 +820,104 @@ body {
     animation: none;
   }
 }
+
+/* Scouting checklist — real pipeline stages ticking off. */
+.scout-checklist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.scout-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-family: 'Overpass Mono', monospace;
+  font-size: 12px;
+  letter-spacing: 0.03em;
+}
+
+.scout-glyph {
+  flex: 0 0 14px;
+  text-align: center;
+}
+
+.scout-label {
+  flex: 1;
+}
+
+.scout-value {
+  color: var(--muted);
+  text-align: right;
+}
+
+.scout-pending {
+  color: var(--line);
+}
+
+.scout-pending .scout-value {
+  color: var(--line);
+}
+
+.scout-active {
+  color: var(--text);
+}
+
+.scout-active .scout-glyph {
+  color: var(--yellow);
+  animation: scout-blink 1s steps(2, jump-none) infinite;
+}
+
+.scout-done {
+  color: var(--muted);
+}
+
+.scout-done .scout-glyph {
+  color: var(--yellow);
+}
+
+@keyframes scout-blink {
+  50% {
+    opacity: 0.25;
+  }
+}
+
+/* Corridor scan dots on the map. */
+.marker-scan {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--muted);
+  opacity: 0.8;
+}
+
+.marker-scan-scanning {
+  animation: scan-pulse 1.1s ease-in-out infinite;
+}
+
+.marker-scan-good {
+  background: var(--yellow);
+  box-shadow: 0 0 8px rgba(247, 201, 72, 0.7);
+}
+
+.marker-scan-bad {
+  background: var(--line);
+  opacity: 0.35;
+}
+
+@keyframes scan-pulse {
+  50% {
+    transform: scale(1.6);
+    opacity: 0.4;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .scout-active .scout-glyph,
+  .marker-scan-scanning {
+    animation: none;
+  }
+}

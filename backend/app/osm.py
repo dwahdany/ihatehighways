@@ -29,6 +29,7 @@ import logging
 import math
 import time
 from pathlib import Path
+from typing import Callable
 
 import httpx
 
@@ -186,10 +187,14 @@ async def _fetch_batch(
     return None
 
 
+OnBatch = Callable[[list[tuple[Point, Point]], list[float]], None]
+
+
 async def score_chunks(
     pairs: list[tuple[Point, Point]],
     settings: Settings,
     deadline_s: float | None = None,
+    on_batch: OnBatch | None = None,
 ) -> list[float | None]:
     """Score all chunk corridors; None entries mean "unknown" (callers must fail open).
 
@@ -212,6 +217,11 @@ async def score_chunks(
             else:
                 results.append(None)
                 misses.append((i, pair))
+    if on_batch is not None:
+        cached_pairs = [pairs[i] for i in range(len(pairs)) if results[i] is not None]
+        cached_scores = [s for s in results if s is not None]
+        if cached_pairs:
+            on_batch(cached_pairs, cached_scores)
     if not misses:
         return results
 
@@ -226,6 +236,8 @@ async def score_chunks(
             if scores is not None:
                 for (index, _), score in zip(batch, scores):
                     scored[index] = score
+                if on_batch is not None:
+                    on_batch([p for _, p in batch], scores)
 
     deadline = deadline_s
     if deadline is None:
@@ -237,7 +249,15 @@ async def score_chunks(
         timeout=settings.osm_timeout_s + 5, headers={"User-Agent": USER_AGENT}
     ) as http:
         tasks = [asyncio.ensure_future(one(batch, http)) for batch in batches]
-        _, pending = await asyncio.wait(tasks, timeout=deadline)
+        # Two-stage wait: after the base deadline, don't stall the whole scout for one
+        # straggling mirror when most corridors are already scored — the missing few
+        # fail open and get cached by a later scout.
+        first_stage = min(deadline, settings.osm_deadline_s)
+        _, pending = await asyncio.wait(tasks, timeout=first_stage)
+        # Early-exit is scout-only (deadline_s None): callers with an explicit flat
+        # deadline (/api/plan's cost filter) want complete scores within their cap.
+        if pending and (deadline_s is not None or len(scored) < 0.7 * len(misses)):
+            _, pending = await asyncio.wait(pending, timeout=deadline - first_stage)
         for task in pending:
             task.cancel()
         if pending:

@@ -130,6 +130,45 @@ def test_scout_long_haul_caps_probes_and_chunk_sizes():
     assert any(firsts[len(firsts) // 2 :])
 
 
+def test_scout_stream_events():
+    import json
+
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+
+    body = {"origin": {"address": "Cologne"}, "destination": {"address": "Frankfurt"}}
+    with TestClient(create_app(SETTINGS)) as client:
+        with client.stream("POST", "/api/scout/stream", json=body) as resp:
+            assert resp.status_code == 200
+            assert resp.headers["content-type"].startswith("application/x-ndjson")
+            events = [json.loads(line) for line in resp.iter_lines() if line]
+
+        types = [e["type"] for e in events]
+        assert types[0] == "route"
+        assert "corridors" in types
+        assert "probing" in types
+        assert types[-1] == "done"
+        assert types.count("done") == 1
+
+        route_ev = events[0]
+        assert all(p["cut_id"] is None for p in route_ev["preview"])
+        assert route_ev["fastest"]["duration_s"] > 0
+
+        done = events[-1]["scout"]
+        assert set(done) == {"origin", "destination", "fastest", "skeleton", "cuts"}
+        cut_events = [e for e in events if e["type"] == "cut"]
+        assert len(cut_events) == len(done["cuts"]) > 0
+        for e in cut_events:
+            assert e["cut"]["avoided_highway_s"] > 0
+
+        # Second call replays the cached result as a single done event.
+        with client.stream("POST", "/api/scout/stream", json=body) as resp2:
+            events2 = [json.loads(line) for line in resp2.iter_lines() if line]
+        assert [e["type"] for e in events2] == ["done"]
+        assert events2[0]["scout"] == done
+
+
 def test_scout_api_contract():
     import os
 

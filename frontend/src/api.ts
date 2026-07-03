@@ -166,12 +166,99 @@ export class ApiError extends Error {
   }
 }
 
+export interface CorridorRef {
+  entry: LatLng
+  exit: LatLng
+}
+
+export interface ScoredCorridor extends CorridorRef {
+  curvy_km: number
+}
+
+/** Progress events from POST /api/scout/stream (NDJSON, one per line). */
+export type ScoutEvent =
+  | {
+      type: 'route'
+      origin: LatLng
+      destination: LatLng
+      fastest: FastestRoute
+      preview: SkeletonPart[]
+    }
+  | { type: 'corridors'; count: number; corridors: CorridorRef[] }
+  | { type: 'scored'; corridors: ScoredCorridor[] }
+  | { type: 'probing'; count: number }
+  | { type: 'cut'; cut: Cut }
+  | { type: 'done'; scout: ScoutResponse }
+  | { type: 'error'; code: string; message: string; status: number }
+
 export async function planRoute(req: PlanRequest): Promise<PlanResponse> {
   return request<PlanResponse>('/api/plan', req)
 }
 
 export async function scoutRoute(req: ScoutRequest): Promise<ScoutResponse> {
   return request<ScoutResponse>('/api/scout', req)
+}
+
+/** Streamed scout: onEvent fires per pipeline stage; the last event is done|error. */
+export async function scoutRouteStream(
+  req: ScoutRequest,
+  onEvent: (event: ScoutEvent) => void,
+): Promise<void> {
+  const res = await fetch(`${API_BASE}/api/scout/stream`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+  })
+  if (!res.ok || !res.body) {
+    throw await toApiError(res)
+  }
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let sawTerminal = false
+  const handleLine = (line: string) => {
+    const event = JSON.parse(line) as ScoutEvent
+    if (event.type === 'done' || event.type === 'error') sawTerminal = true
+    onEvent(event)
+  }
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    let newline = buffer.indexOf('\n')
+    while (newline >= 0) {
+      const line = buffer.slice(0, newline).trim()
+      buffer = buffer.slice(newline + 1)
+      if (line) handleLine(line)
+      newline = buffer.indexOf('\n')
+    }
+  }
+  buffer += decoder.decode()
+  const rest = buffer.trim()
+  if (rest) handleLine(rest)
+  if (!sawTerminal) {
+    // A cleanly truncated stream (proxy timeout, backend restart) must not resolve as
+    // success — the UI would end up blank with no error.
+    throw new ApiError(0, 'STREAM_TRUNCATED', 'The scout stream ended unexpectedly.')
+  }
+}
+
+async function toApiError(res: Response): Promise<ApiError> {
+  let code: string = 'UPSTREAM'
+  let message = `Plan request failed with status ${res.status}.`
+  let enveloped = false
+  const raw = await res.text().catch(() => '')
+  try {
+    const body = JSON.parse(raw) as ErrorBody
+    if (body.detail && typeof body.detail === 'object' && body.detail.code) {
+      enveloped = true
+      code = body.detail.code
+      if (body.detail.message) message = body.detail.message
+    }
+  } catch {
+    // non-JSON error body; keep defaults
+  }
+  return new ApiError(res.status, code, message, enveloped, enveloped ? '' : raw)
 }
 
 async function request<T>(path: string, payload: unknown): Promise<T> {
@@ -181,21 +268,7 @@ async function request<T>(path: string, payload: unknown): Promise<T> {
     body: JSON.stringify(payload),
   })
   if (!res.ok) {
-    let code: string = 'UPSTREAM'
-    let message = `Plan request failed with status ${res.status}.`
-    let enveloped = false
-    const raw = await res.text().catch(() => '')
-    try {
-      const body = JSON.parse(raw) as ErrorBody
-      if (body.detail && typeof body.detail === 'object' && body.detail.code) {
-        enveloped = true
-        code = body.detail.code
-        if (body.detail.message) message = body.detail.message
-      }
-    } catch {
-      // non-JSON error body; keep defaults
-    }
-    throw new ApiError(res.status, code, message, enveloped, enveloped ? '' : raw)
+    throw await toApiError(res)
   }
   return (await res.json()) as T
 }

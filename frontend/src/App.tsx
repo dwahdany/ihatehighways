@@ -1,9 +1,11 @@
 import { useMemo, useState } from 'react'
 import type { FormEvent } from 'react'
 import { APIProvider } from '@vis.gl/react-google-maps'
-import { ApiError, scoutRoute } from './api'
+import { ApiError, scoutRouteStream } from './api'
 import type { ScoutResponse } from './api'
 import { buildGmapsUrl, composeRide, presetSelection } from './lib/compose'
+import { EMPTY_PROGRESS, applyEvent } from './lib/progress'
+import type { ScoutProgress } from './lib/progress'
 import MapView from './components/MapView'
 import PlaceField from './components/PlaceField'
 import type { PlaceSelection } from './components/PlaceField'
@@ -65,6 +67,7 @@ function Planner({ apiKey }: { apiKey: string }) {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [scout, setScout] = useState<ScoutResponse | null>(null)
+  const [progress, setProgress] = useState<ScoutProgress | null>(null)
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set())
   const [scoutKey, setScoutKey] = useState(0)
   const [hasScouted, setHasScouted] = useState(false)
@@ -76,18 +79,40 @@ function Planner({ apiKey }: { apiKey: string }) {
     if (!origin || !destination || loading) return
     setLoading(true)
     setError(null)
+    setProgress(EMPTY_PROGRESS)
     try {
-      const result = await scoutRoute({
-        origin: { place_id: origin.placeId },
-        destination: { place_id: destination.placeId },
-      })
-      setScout(result)
-      setSelected(presetSelection(result, 'value'))
-      setScoutKey((key) => key + 1) // re-key TradePanel so the reveal animation replays
+      await scoutRouteStream(
+        {
+          origin: { place_id: origin.placeId },
+          destination: { place_id: destination.placeId },
+        },
+        (streamEvent) => {
+          if (streamEvent.type === 'done') {
+            setScout(streamEvent.scout)
+            setSelected(presetSelection(streamEvent.scout, 'value'))
+            setScoutKey((key) => key + 1) // re-key TradePanel so the reveal replays
+          } else if (streamEvent.type === 'error') {
+            setError(
+              describeError(
+                new ApiError(streamEvent.status, streamEvent.code, streamEvent.message, true),
+              ),
+            )
+            // Don't snap back to the previous ride under a fresh error — the rider
+            // just watched the new route being drawn; map and panel must agree.
+            setScout(null)
+            setSelected(new Set())
+          } else {
+            setProgress((current) => applyEvent(current ?? EMPTY_PROGRESS, streamEvent))
+          }
+        },
+      )
     } catch (err) {
       setError(describeError(err))
+      setScout(null)
+      setSelected(new Set())
     } finally {
       setLoading(false)
+      setProgress(null)
       setHasScouted(true)
     }
   }
@@ -125,7 +150,12 @@ function Planner({ apiKey }: { apiKey: string }) {
   return (
     <APIProvider apiKey={apiKey}>
       <div className="app">
-        <MapView scout={scout} selected={selected} onToggle={toggleCut} />
+        <MapView
+          scout={scout}
+          selected={selected}
+          onToggle={toggleCut}
+          progress={loading ? progress : null}
+        />
         <aside className="panel">
           <header>
             <h1 className="wordmark">
@@ -143,7 +173,7 @@ function Planner({ apiKey }: { apiKey: string }) {
           </form>
 
           <div className="results" aria-live="polite">
-            {loading && <ScoutLoader />}
+            {loading && <ScoutLoader progress={progress ?? EMPTY_PROGRESS} />}
             {!loading && error && <div className="error-card">{error}</div>}
             {!loading && !hasScouted && !scout && (
               <p className="empty-line">

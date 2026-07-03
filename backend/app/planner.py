@@ -10,7 +10,9 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import Protocol, Sequence
+from typing import AsyncIterator, Callable, Protocol, Sequence
+
+Emit = Callable[[dict], None]
 
 from . import classify, gmaps, knapsack, osm, polyline_util
 from .classify import Chunk
@@ -167,39 +169,20 @@ def _curviness(route: GRoute, entry: Point, exit: Point) -> float:
 
 
 async def _query_detours(
-    chunks: Sequence[Chunk], client: RoutesClient, settings: Settings
+    chunks: Sequence[Chunk],
+    client: RoutesClient,
+    settings: Settings,
+    on_candidate: Callable[[_Candidate], None] | None = None,
 ) -> list[_Candidate]:
     semaphore = asyncio.Semaphore(MAX_PARALLEL_DETOUR_QUERIES)
 
-    async def one(chunk: Chunk) -> GRoute | None:
-        async with semaphore:
-            try:
-                return await client.compute_route(
-                    WaypointSpec(lat_lng=chunk.entry),
-                    WaypointSpec(lat_lng=chunk.exit),
-                    avoid_highways=True,
-                    origin_heading=chunk.entry_heading,
-                )
-            except Exception as exc:  # query failure -> skip chunk, log, continue
-                logger.warning(
-                    "detour query failed for steps [%d,%d): %s",
-                    chunk.step_start,
-                    chunk.step_end,
-                    exc,
-                )
-                return None
-
-    routes = await asyncio.gather(*(one(c) for c in chunks))
-    candidates: list[_Candidate] = []
-    for chunk, route in zip(chunks, routes):
-        if route is None:
-            continue
+    def evaluate(chunk: Chunk, route: GRoute) -> _Candidate | None:
         if route.distance_m > MAX_DETOUR_DISTANCE_FACTOR * chunk.distance_m:
             logger.info("skipping detour: distance %.0f m > 3x chunk", route.distance_m)
-            continue
+            return None
         if route.duration_s > MAX_DETOUR_DURATION_FACTOR * chunk.baseline_s:
             logger.info("skipping detour: duration %.0f s > 4x baseline", route.duration_s)
-            continue
+            return None
         hw_s, hw_m = _route_highway_stats(route, settings)
         extra_cost_s = route.duration_s - chunk.baseline_s
         # Chunk steps are all highway (bridged gaps included), so the chunk's baseline
@@ -215,7 +198,7 @@ async def _query_detours(
                 value_s,
                 chunk.baseline_s,
             )
-            continue
+            return None
         # Efficiency gate: a paid detour must shed highway time worth a reasonable
         # fraction of its cost, or it is a junk trade (e.g. crawling through city
         # streets to dodge an urban motorway).
@@ -225,18 +208,40 @@ async def _query_detours(
                 extra_cost_s,
                 value_s,
             )
-            continue
-        candidates.append(
-            _Candidate(
-                chunk=chunk,
-                route=route,
-                extra_cost_s=extra_cost_s,
-                value_s=value_s,
-                hw_in_detour_s=hw_s,
-                hw_in_detour_m=hw_m,
-            )
+            return None
+        return _Candidate(
+            chunk=chunk,
+            route=route,
+            extra_cost_s=extra_cost_s,
+            value_s=value_s,
+            hw_in_detour_s=hw_s,
+            hw_in_detour_m=hw_m,
         )
-    return candidates
+
+    async def one(chunk: Chunk) -> _Candidate | None:
+        async with semaphore:
+            try:
+                route = await client.compute_route(
+                    WaypointSpec(lat_lng=chunk.entry),
+                    WaypointSpec(lat_lng=chunk.exit),
+                    avoid_highways=True,
+                    origin_heading=chunk.entry_heading,
+                )
+            except Exception as exc:  # query failure -> skip chunk, log, continue
+                logger.warning(
+                    "detour query failed for steps [%d,%d): %s",
+                    chunk.step_start,
+                    chunk.step_end,
+                    exc,
+                )
+                return None
+        candidate = evaluate(chunk, route)
+        if candidate is not None and on_candidate is not None:
+            on_candidate(candidate)
+        return candidate
+
+    results = await asyncio.gather(*(one(c) for c in chunks))
+    return [c for c in results if c is not None]
 
 
 def _span_from_candidates(run: Sequence[_Candidate], route: GRoute, settings: Settings) -> _Span:
@@ -591,11 +596,33 @@ def _pick_by_scores(
     return sorted(picked)
 
 
-async def _select_scout_chunks(chunks: list[Chunk], settings: Settings) -> list[Chunk]:
+async def _select_scout_chunks(
+    chunks: list[Chunk], settings: Settings, emit: Emit | None = None
+) -> list[Chunk]:
     if not chunks:
         return chunks
     if settings.osm_enabled and not settings.ihh_mock:
-        scores = await osm.score_chunks([(c.entry, c.exit) for c in chunks], settings)
+        on_batch = None
+        if emit is not None:
+
+            def on_batch(pairs: list, batch_scores: list) -> None:
+                emit(
+                    {
+                        "type": "scored",
+                        "corridors": [
+                            {
+                                "entry": {"lat": p[0][0], "lng": p[0][1]},
+                                "exit": {"lat": p[1][0], "lng": p[1][1]},
+                                "curvy_km": round(s, 1),
+                            }
+                            for p, s in zip(pairs, batch_scores)
+                        ],
+                    }
+                )
+
+        scores = await osm.score_chunks(
+            [(c.entry, c.exit) for c in chunks], settings, on_batch=on_batch
+        )
     else:
         scores = [None] * len(chunks)
     indices = _pick_by_scores(
@@ -606,19 +633,62 @@ async def _select_scout_chunks(chunks: list[Chunk], settings: Settings) -> list[
     return [chunks[i] for i in indices]
 
 
-async def scout(req: ScoutRequest, client: RoutesClient, settings: Settings) -> ScoutResponse:
+def _cut_fields(c: _Candidate, steps: Sequence[GStep]) -> dict:
+    """CutOut fields (minus id) for one gated candidate — shared by the final response
+    and the live stream."""
+    mid = c.chunk.entry
+    if c.route.encoded_polyline:
+        mid = polyline_util.point_at_fraction(
+            polyline_util.decode(c.route.encoded_polyline), 0.5
+        )
+    return {
+        "road": classify.road_name(steps, c.chunk.step_start, c.chunk.step_end),
+        "entry": LatLng(lat=c.chunk.entry[0], lng=c.chunk.entry[1]),
+        "exit": LatLng(lat=c.chunk.exit[0], lng=c.chunk.exit[1]),
+        "mid": LatLng(lat=mid[0], lng=mid[1]),
+        "encoded_polyline": c.route.encoded_polyline,
+        "detour_duration_s": round(c.route.duration_s),
+        "detour_distance_m": round(c.route.distance_m),
+        "extra_duration_s": round(c.extra_cost_s),
+        "avoided_highway_s": round(c.value_s),
+        "avoided_highway_m": round(c.chunk.distance_m - c.hw_in_detour_m),
+        "curviness": round(_curviness(c.route, c.chunk.entry, c.chunk.exit), 3),
+    }
+
+
+async def scout(
+    req: ScoutRequest,
+    client: RoutesClient,
+    settings: Settings,
+    emit: Emit | None = None,
+) -> ScoutResponse:
     """Evaluate ALL viable highway cuts so the rider composes the ride themselves.
 
     Same pipeline as plan() but without a knapsack: every gated candidate is returned
     as a priced, toggleable cut; selection totals are additive client-side
     (fastest.duration_s + Σ selected extra_duration_s). Chunks stay human-sized on any
     route length — OSM corridor scores decide which of them earn a paid probe.
+
+    When `emit` is given, progress events stream out at every pipeline stage
+    (docs/api.md, /api/scout/stream): route -> corridors -> scored* -> probing ->
+    cut* -> (caller emits done).
     """
     base = await _fetch_base(req.origin, req.destination, client)
     steps, factors = _flatten(base)
     steps, factors = classify.atomize_steps(steps, factors, settings.step_atom_m)
     flags = classify.classify_steps(steps, settings)
     fastest = _fastest_summary(base, steps, factors, flags)
+    if emit is not None:
+        preview = _build_skeleton(steps, factors, flags, [])
+        emit(
+            {
+                "type": "route",
+                "origin": {"lat": steps[0].start[0], "lng": steps[0].start[1]},
+                "destination": {"lat": steps[-1].end[0], "lng": steps[-1].end[1]},
+                "fastest": fastest.model_dump(mode="json"),
+                "preview": [p.model_dump(mode="json") for p in preview],
+            }
+        )
 
     stretches = classify.find_stretches(steps, flags, settings)
     total_hw_km = (
@@ -635,34 +705,38 @@ async def scout(req: ScoutRequest, client: RoutesClient, settings: Settings) -> 
         chunk_km=eff_chunk_km,
         max_chunks=settings.scout_max_raw_chunks,
     )
-    chunks = await _select_scout_chunks(chunks, settings)
-    candidates = await _query_detours(chunks, client, settings)
+    if emit is not None:
+        emit(
+            {
+                "type": "corridors",
+                "count": len(chunks),
+                "corridors": [
+                    {
+                        "entry": {"lat": c.entry[0], "lng": c.entry[1]},
+                        "exit": {"lat": c.exit[0], "lng": c.exit[1]},
+                    }
+                    for c in chunks
+                ],
+            }
+        )
+    chunks = await _select_scout_chunks(chunks, settings, emit)
+    if emit is not None:
+        emit({"type": "probing", "count": len(chunks)})
+
+    on_candidate = None
+    if emit is not None:
+
+        def on_candidate(c: _Candidate) -> None:
+            fields = _cut_fields(c, steps)
+            emit({"type": "cut", "cut": CutOut(id="", **fields).model_dump(mode="json")})
+
+    candidates = await _query_detours(chunks, client, settings, on_candidate=on_candidate)
     candidates = sorted(candidates, key=lambda c: c.chunk.step_start)
 
     skeleton = _build_skeleton(steps, factors, flags, candidates)
-    cuts = []
-    for i, c in enumerate(candidates):
-        mid = c.chunk.entry
-        if c.route.encoded_polyline:
-            mid = polyline_util.point_at_fraction(
-                polyline_util.decode(c.route.encoded_polyline), 0.5
-            )
-        cuts.append(
-            CutOut(
-                id=f"c{i}",
-                road=classify.road_name(steps, c.chunk.step_start, c.chunk.step_end),
-                entry=LatLng(lat=c.chunk.entry[0], lng=c.chunk.entry[1]),
-                exit=LatLng(lat=c.chunk.exit[0], lng=c.chunk.exit[1]),
-                mid=LatLng(lat=mid[0], lng=mid[1]),
-                encoded_polyline=c.route.encoded_polyline,
-                detour_duration_s=round(c.route.duration_s),
-                detour_distance_m=round(c.route.distance_m),
-                extra_duration_s=round(c.extra_cost_s),
-                avoided_highway_s=round(c.value_s),
-                avoided_highway_m=round(c.chunk.distance_m - c.hw_in_detour_m),
-                curviness=round(_curviness(c.route, c.chunk.entry, c.chunk.exit), 3),
-            )
-        )
+    cuts = [
+        CutOut(id=f"c{i}", **_cut_fields(c, steps)) for i, c in enumerate(candidates)
+    ]
     return ScoutResponse(
         origin=LatLng(lat=steps[0].start[0], lng=steps[0].start[1]),
         destination=LatLng(lat=steps[-1].end[0], lng=steps[-1].end[1]),
@@ -670,3 +744,39 @@ async def scout(req: ScoutRequest, client: RoutesClient, settings: Settings) -> 
         skeleton=skeleton,
         cuts=cuts,
     )
+
+
+async def scout_events(
+    req: ScoutRequest, client: RoutesClient, settings: Settings
+) -> AsyncIterator[dict]:
+    """Run scout() and yield its progress events, ending with done or error."""
+    queue: asyncio.Queue[dict] = asyncio.Queue()
+
+    async def run() -> None:
+        try:
+            resp = await scout(req, client, settings, emit=queue.put_nowait)
+            queue.put_nowait({"type": "done", "scout": resp.model_dump(mode="json")})
+        except PlanError as exc:
+            queue.put_nowait(
+                {"type": "error", "code": exc.code, "message": exc.message, "status": exc.status}
+            )
+        except Exception:
+            logger.exception("scout stream failed")
+            queue.put_nowait(
+                {
+                    "type": "error",
+                    "code": "UPSTREAM",
+                    "message": "Scouting failed unexpectedly. Try again in a moment.",
+                    "status": 502,
+                }
+            )
+
+    task = asyncio.create_task(run())
+    try:
+        while True:
+            event = await queue.get()
+            yield event
+            if event["type"] in ("done", "error"):
+                break
+    finally:
+        task.cancel()

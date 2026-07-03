@@ -126,6 +126,24 @@ free. Skeleton polylines concatenate into the fastest route; every `cut_id` matc
 exactly one skeleton part (always `kind: "highway"`). Same error envelope and rate
 limits as `/api/plan`.
 
+## `POST /api/scout/stream`
+
+Same request/semantics as `/api/scout`, but progress streams as NDJSON (one JSON per
+line) so clients can build the map live:
+
+```
+{"type":"route", "origin":…, "destination":…, "fastest":…, "preview":[SkeletonPart…]}   // preview = skeleton, no cut_ids yet
+{"type":"corridors", "count":39, "corridors":[{"entry":…, "exit":…}…]}
+{"type":"scored", "corridors":[{"entry":…, "exit":…, "curvy_km":8.4}…]}                 // per OSM batch; absent when OSM is off
+{"type":"probing", "count":12}
+{"type":"cut", "cut":CutOut}                                                            // per gated probe, id empty, order nondeterministic
+{"type":"done", "scout":ScoutResponse}                                                  // authoritative final payload
+{"type":"error", "code":…, "message":…, "status":…}                                     // terminal instead of done
+```
+
+Cached scouts replay as a single `done` event. Rate limiting and validation errors are
+returned as normal HTTP errors before the stream starts.
+
 ## `GET /api/health`
 
 ```json
