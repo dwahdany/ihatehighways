@@ -921,3 +921,33 @@ body {
     animation: none;
   }
 }
+
+/* Preset cost preview + Google Maps handoff fidelity. */
+.preset-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+
+.preset-extra {
+  font-size: 10.5px;
+  opacity: 0.75;
+}
+
+.handoff-warning {
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  background: var(--panel-2);
+  border-left: 3px solid var(--yellow);
+  border-radius: var(--radius-control);
+  font-size: 13px;
+}
+
+.handoff-note {
+  margin: 8px 0 0;
+  font-family: 'Overpass Mono', monospace;
+  font-size: 10.5px;
+  letter-spacing: 0.03em;
+  color: var(--muted);
+}

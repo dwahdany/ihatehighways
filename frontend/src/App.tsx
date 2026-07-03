@@ -3,7 +3,8 @@ import type { FormEvent } from 'react'
 import { APIProvider } from '@vis.gl/react-google-maps'
 import { ApiError, scoutRouteStream } from './api'
 import type { ScoutResponse } from './api'
-import { buildGmapsUrl, composeRide, presetSelection } from './lib/compose'
+import { buildHandoff, composeRide, presetSelection } from './lib/compose'
+import { formatSignedMinutes } from './lib/format'
 import { EMPTY_PROGRESS, applyEvent } from './lib/progress'
 import type { ScoutProgress } from './lib/progress'
 import MapView from './components/MapView'
@@ -132,10 +133,20 @@ function Planner({ apiKey }: { apiKey: string }) {
     () => (scout ? composeRide(scout, NOTHING_SELECTED).segments : []),
     [scout],
   )
-  const gmapsUrl = useMemo(
-    () => (scout ? buildGmapsUrl(scout, selected) : ''),
+  const handoff = useMemo(
+    () => (scout ? buildHandoff(scout, selected) : null),
     [scout, selected],
   )
+  // What each preset would cost — shown on the buttons so a tap is never a surprise.
+  const presetExtras = useMemo(() => {
+    if (!scout) return null
+    const entries = PRESETS.map((preset) => [
+      preset.key,
+      composeRide(scout, presetSelection(scout, preset.key)).extra_duration_s,
+    ])
+    return Object.fromEntries(entries) as Record<PresetKey, number>
+  }, [scout])
+
   const activePreset = useMemo<PresetKey | null>(() => {
     if (!scout) return null
     for (const preset of PRESETS) {
@@ -187,7 +198,7 @@ function Planner({ apiKey }: { apiKey: string }) {
                   fastest={scout.fastest}
                   fastestSegments={fastestSegments}
                   ride={ride}
-                  gmapsUrl={gmapsUrl}
+                  handoff={handoff!}
                 />
                 {scout.cuts.length > 0 ? (
                   <>
@@ -200,7 +211,12 @@ function Planner({ apiKey }: { apiKey: string }) {
                           aria-pressed={activePreset === preset.key}
                           onClick={() => setSelected(presetSelection(scout, preset.key))}
                         >
-                          {preset.label}
+                          <span>{preset.label}</span>
+                          {presetExtras && (
+                            <span className="preset-extra">
+                              {formatSignedMinutes(presetExtras[preset.key])} min
+                            </span>
+                          )}
                         </button>
                       ))}
                     </div>

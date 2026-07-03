@@ -86,10 +86,11 @@ export function cutWorth(cut: Cut): number {
   return (cut.avoided_highway_s * boost) / cut.extra_duration_s
 }
 
-/** A cut is a "good deal" when free (jammed highway) or its worth clears 1.0. */
-function isGoodDeal(cut: Cut): boolean {
-  return cutWorth(cut) >= 1.0
-}
+const GOOD_DEAL_MIN_WORTH = 1.0
+// Default-selection sanity budget: individually-good cuts must not quietly turn a
+// 7 h ride into a 13 h one. The rider can always toggle more on.
+const GOOD_DEAL_BUDGET_FRACTION = 0.15
+const GOOD_DEAL_MIN_BUDGET_S = 15 * 60
 
 export function presetSelection(
   scout: ScoutResponse,
@@ -99,8 +100,24 @@ export function presetSelection(
     case 'fastest':
       // Free cuts still belong in "fastest": the highway is jammed there.
       return new Set(scout.cuts.filter((c) => c.extra_duration_s <= 0).map((c) => c.id))
-    case 'value':
-      return new Set(scout.cuts.filter(isGoodDeal).map((c) => c.id))
+    case 'value': {
+      // Best trades first, within ~15% of the fastest time in total.
+      const budget = Math.max(
+        scout.fastest.duration_s * GOOD_DEAL_BUDGET_FRACTION,
+        GOOD_DEAL_MIN_BUDGET_S,
+      )
+      const picked = new Set<string>()
+      let spent = 0
+      const ranked = [...scout.cuts].sort((a, b) => cutWorth(b) - cutWorth(a))
+      for (const cut of ranked) {
+        if (cutWorth(cut) < GOOD_DEAL_MIN_WORTH) break
+        const cost = Math.max(cut.extra_duration_s, 0)
+        if (spent + cost > budget) continue // a cheaper good deal may still fit
+        picked.add(cut.id)
+        spent += cost
+      }
+      return picked
+    }
     case 'country':
       return new Set(scout.cuts.map((c) => c.id))
   }
@@ -108,12 +125,23 @@ export function presetSelection(
 
 const GMAPS_MAX_WAYPOINTS = 9
 
+export interface Handoff {
+  url: string
+  /** Cuts pinned entry+mid+exit — Google follows them closely. */
+  full: number
+  /** Cuts pinned entry+exit only (waypoint cap) — Google may straighten them. */
+  loose: number
+  /** Cuts that didn't fit Google's 9-waypoint budget at all. */
+  dropped: number
+}
+
 /**
- * Google Maps deep link pinning each selected cut with entry/mid/exit waypoints.
- * Mirrors the backend's budgeting: midpoints of the least valuable cuts are dropped
- * first, then whole cuts.
+ * Google Maps deep link pinning each selected cut with entry/mid/exit waypoints,
+ * plus a fidelity report. Google caps directions links at 9 waypoints and re-routes
+ * freely between pins (avoid-highways does NOT carry over), so midpoints of the
+ * least valuable cuts are dropped first, then whole cuts — and the UI must say so.
  */
-export function buildGmapsUrl(scout: ScoutResponse, selected: ReadonlySet<string>): string {
+export function buildHandoff(scout: ScoutResponse, selected: ReadonlySet<string>): Handoff {
   const cuts = scout.cuts.filter((cut) => selected.has(cut.id))
   const withMid = cuts.map(() => true)
   const byValue = cuts
@@ -147,5 +175,13 @@ export function buildGmapsUrl(scout: ScoutResponse, selected: ReadonlySet<string
     travelmode: 'driving',
   })
   if (waypoints.length > 0) params.set('waypoints', waypoints.join('|'))
-  return `https://www.google.com/maps/dir/?${params.toString()}`
+
+  const kept = cuts.length - dropped.size
+  const loose = cuts.filter((_, index) => !dropped.has(index) && !withMid[index]).length
+  return {
+    url: `https://www.google.com/maps/dir/?${params.toString()}`,
+    full: kept - loose,
+    loose,
+    dropped: dropped.size,
+  }
 }
