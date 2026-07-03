@@ -167,6 +167,56 @@ def test_scout_long_haul_caps_probes_and_chunk_sizes():
     assert any(firsts[len(firsts) // 2 :])
 
 
+def test_scout_probes_launch_while_scoring_still_runs(monkeypatch):
+    """Clearly-good corridors probe the moment their OSM batch lands — probing
+    overlaps the scoring wait instead of bursting after it."""
+    from app import planner
+    from app.google_routes import GLeg, GRoute, GStep
+    from app.planner import _scout_probes
+
+    settings = Settings(
+        _env_file=None, ihh_mock=False, osm_enabled=True, scout_max_probes=4
+    )
+    chunks = [make_chunk(i) for i in range(8)]
+    order: list[str] = []
+
+    async def fake_score_chunks(pairs, s, deadline_s=None, on_batch=None):
+        assert on_batch is not None
+        on_batch(pairs[:3], [10.0, 9.0, 8.0])  # adjacent, clearly good
+        await asyncio.sleep(0.05)  # the rest of "scoring" takes a while
+        order.append("scoring-done")
+        return [10.0, 9.0, 8.0] + [None] * 5
+
+    monkeypatch.setattr(planner.osm, "score_chunks", fake_score_chunks)
+
+    class CountryClient:
+        async def compute_route(self, origin, destination, avoid_highways=False, origin_heading=None):
+            order.append("probe")
+            start, end = origin.lat_lng, destination.lat_lng
+            distance = polyline_util.haversine_m(start, end) * 1.3
+            static = distance / (60 / 3.6)  # honest country detour, no highway
+            step = GStep(
+                distance_m=distance,
+                static_duration_s=static,
+                encoded_polyline=polyline_util.encode([start, end]),
+                maneuver="",
+                instructions="Follow the country roads",
+                start=start,
+                end=end,
+            )
+            leg = GLeg(static, static, distance, [step])
+            return GRoute(static, static, distance, step.encoded_polyline, [leg])
+
+    candidates = asyncio.run(
+        _scout_probes(chunks, CountryClient(), settings, None, None, None)
+    )
+    # The good trio's probe started before scoring finished.
+    assert "probe" in order[: order.index("scoring-done")]
+    ranges = [(c.chunk.step_start, c.chunk.step_end) for c in candidates]
+    assert (0, 6) in ranges  # merged 3-chunk span, launched immediately
+    assert len(candidates) <= settings.scout_max_probes
+
+
 def test_scout_stream_events():
     import json
 

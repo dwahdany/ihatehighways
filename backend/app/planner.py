@@ -168,6 +168,82 @@ def _curviness(route: GRoute, entry: Point, exit: Point) -> float:
     return max(1.0, polyline_util.path_length_m(pts) / straight)
 
 
+async def _probe_span(
+    chunk: Chunk,
+    client: RoutesClient,
+    settings: Settings,
+    semaphore: asyncio.Semaphore,
+    on_candidate: Callable[[_Candidate], None] | None = None,
+    on_probe: Callable[[GRoute, bool], None] | None = None,
+) -> _Candidate | None:
+    """Probe one (possibly merged) corridor: paid Google query + gates."""
+    async with semaphore:
+        try:
+            route = await client.compute_route(
+                WaypointSpec(lat_lng=chunk.entry),
+                WaypointSpec(lat_lng=chunk.exit),
+                avoid_highways=True,
+                origin_heading=chunk.entry_heading,
+            )
+        except Exception as exc:  # query failure -> skip chunk, log, continue
+            logger.warning(
+                "detour query failed for steps [%d,%d): %s",
+                chunk.step_start,
+                chunk.step_end,
+                exc,
+            )
+            return None
+    candidate = _evaluate_probe(chunk, route, settings)
+    if on_probe is not None:
+        on_probe(route, candidate is not None)
+    if candidate is not None and on_candidate is not None:
+        on_candidate(candidate)
+    return candidate
+
+
+def _evaluate_probe(chunk: Chunk, route: GRoute, settings: Settings) -> _Candidate | None:
+    if route.distance_m > MAX_DETOUR_DISTANCE_FACTOR * chunk.distance_m:
+        logger.info("skipping detour: distance %.0f m > 3x chunk", route.distance_m)
+        return None
+    if route.duration_s > MAX_DETOUR_DURATION_FACTOR * chunk.baseline_s:
+        logger.info("skipping detour: duration %.0f s > 4x baseline", route.duration_s)
+        return None
+    hw_s, hw_m = _route_highway_stats(route, settings)
+    extra_cost_s = route.duration_s - chunk.baseline_s
+    # Chunk steps are all highway (bridged gaps included), so the chunk's baseline
+    # highway time is its full baseline.
+    value_s = chunk.baseline_s - hw_s
+    # Escape gate: avoidHighways is soft — between two mid-motorway points it often
+    # just stays on the motorway (observed on real A3 data, where leg-average
+    # traffic scaling even made such non-escapes look "free"). A real detour sheds
+    # most of the chunk's highway time.
+    if value_s < settings.min_avoided_fraction * chunk.baseline_s:
+        logger.info(
+            "skipping detour: only avoids %.0f s of the chunk's %.0f s highway time",
+            value_s,
+            chunk.baseline_s,
+        )
+        return None
+    # Efficiency gate: a paid detour must shed highway time worth a reasonable
+    # fraction of its cost, or it is a junk trade (e.g. crawling through city
+    # streets to dodge an urban motorway).
+    if extra_cost_s > 0 and value_s < settings.min_detour_efficiency * extra_cost_s:
+        logger.info(
+            "skipping detour: pays %.0f s to avoid only %.0f s of highway",
+            extra_cost_s,
+            value_s,
+        )
+        return None
+    return _Candidate(
+        chunk=chunk,
+        route=route,
+        extra_cost_s=extra_cost_s,
+        value_s=value_s,
+        hw_in_detour_s=hw_s,
+        hw_in_detour_m=hw_m,
+    )
+
+
 async def _query_detours(
     chunks: Sequence[Chunk],
     client: RoutesClient,
@@ -176,74 +252,9 @@ async def _query_detours(
     on_probe: Callable[[GRoute, bool], None] | None = None,
 ) -> list[_Candidate]:
     semaphore = asyncio.Semaphore(MAX_PARALLEL_DETOUR_QUERIES)
-
-    def evaluate(chunk: Chunk, route: GRoute) -> _Candidate | None:
-        if route.distance_m > MAX_DETOUR_DISTANCE_FACTOR * chunk.distance_m:
-            logger.info("skipping detour: distance %.0f m > 3x chunk", route.distance_m)
-            return None
-        if route.duration_s > MAX_DETOUR_DURATION_FACTOR * chunk.baseline_s:
-            logger.info("skipping detour: duration %.0f s > 4x baseline", route.duration_s)
-            return None
-        hw_s, hw_m = _route_highway_stats(route, settings)
-        extra_cost_s = route.duration_s - chunk.baseline_s
-        # Chunk steps are all highway (bridged gaps included), so the chunk's baseline
-        # highway time is its full baseline.
-        value_s = chunk.baseline_s - hw_s
-        # Escape gate: avoidHighways is soft — between two mid-motorway points it often
-        # just stays on the motorway (observed on real A3 data, where leg-average
-        # traffic scaling even made such non-escapes look "free"). A real detour sheds
-        # most of the chunk's highway time.
-        if value_s < settings.min_avoided_fraction * chunk.baseline_s:
-            logger.info(
-                "skipping detour: only avoids %.0f s of the chunk's %.0f s highway time",
-                value_s,
-                chunk.baseline_s,
-            )
-            return None
-        # Efficiency gate: a paid detour must shed highway time worth a reasonable
-        # fraction of its cost, or it is a junk trade (e.g. crawling through city
-        # streets to dodge an urban motorway).
-        if extra_cost_s > 0 and value_s < settings.min_detour_efficiency * extra_cost_s:
-            logger.info(
-                "skipping detour: pays %.0f s to avoid only %.0f s of highway",
-                extra_cost_s,
-                value_s,
-            )
-            return None
-        return _Candidate(
-            chunk=chunk,
-            route=route,
-            extra_cost_s=extra_cost_s,
-            value_s=value_s,
-            hw_in_detour_s=hw_s,
-            hw_in_detour_m=hw_m,
-        )
-
-    async def one(chunk: Chunk) -> _Candidate | None:
-        async with semaphore:
-            try:
-                route = await client.compute_route(
-                    WaypointSpec(lat_lng=chunk.entry),
-                    WaypointSpec(lat_lng=chunk.exit),
-                    avoid_highways=True,
-                    origin_heading=chunk.entry_heading,
-                )
-            except Exception as exc:  # query failure -> skip chunk, log, continue
-                logger.warning(
-                    "detour query failed for steps [%d,%d): %s",
-                    chunk.step_start,
-                    chunk.step_end,
-                    exc,
-                )
-                return None
-        candidate = evaluate(chunk, route)
-        if on_probe is not None:
-            on_probe(route, candidate is not None)
-        if candidate is not None and on_candidate is not None:
-            on_candidate(candidate)
-        return candidate
-
-    results = await asyncio.gather(*(one(c) for c in chunks))
+    results = await asyncio.gather(
+        *(_probe_span(c, client, settings, semaphore, on_candidate, on_probe) for c in chunks)
+    )
     return [c for c in results if c is not None]
 
 
@@ -637,47 +648,118 @@ def _plan_probe_spans(
     return merged
 
 
-async def _select_scout_chunks(
-    chunks: list[Chunk], settings: Settings, emit: Emit | None = None
-) -> list[Chunk]:
+async def _scout_probes(
+    chunks: list[Chunk],
+    client: RoutesClient,
+    settings: Settings,
+    emit: Emit | None,
+    on_candidate: Callable[[_Candidate], None] | None,
+    on_probe: Callable[[GRoute, bool], None] | None,
+) -> list[_Candidate]:
+    """Score corridors and probe them AS scores arrive.
+
+    Clearly-good spans (avg >= 2x the curvy gate) launch their paid probe the moment
+    their OSM batch lands — probing overlaps the OSM wait, cuts stream throughout the
+    scout instead of in one burst at the end, and total latency drops. Borderline and
+    never-scored corridors wait for the final ranking with whatever budget remains
+    (blind pairs when Overpass gave nothing).
+    """
     if not chunks:
-        return chunks
-    if settings.osm_enabled and not settings.ihh_mock:
-        on_batch = None
-        if emit is not None:
+        return []
+    semaphore = asyncio.Semaphore(MAX_PARALLEL_DETOUR_QUERIES)
+    budget = settings.scout_max_probes
+    tasks: list[asyncio.Task] = []
+    launched: set[int] = set()
+    prompt_avg = settings.osm_min_curvy_km * 2
+    pairs = [(c.entry, c.exit) for c in chunks]
+    index_by_pair = {pair: i for i, pair in enumerate(pairs)}
+    live_scores: dict[int, float] = {}
 
-            def on_batch(pairs: list, batch_scores: list) -> None:
-                emit(
-                    {
-                        "type": "scored",
-                        "corridors": [
-                            {
-                                "entry": {"lat": p[0][0], "lng": p[0][1]},
-                                "exit": {"lat": p[1][0], "lng": p[1][1]},
-                                "curvy_km": round(s, 1),
-                            }
-                            for p, s in zip(pairs, batch_scores)
-                        ],
-                    }
-                )
-
-        scores = await osm.score_chunks(
-            [(c.entry, c.exit) for c in chunks], settings, on_batch=on_batch
+    def launch(indices: list[int]) -> None:
+        nonlocal budget
+        if budget <= 0 or any(i in launched for i in indices):
+            return
+        budget -= 1
+        launched.update(indices)
+        span = [chunks[i] for i in indices]
+        merged = classify.merge_chunks(span) if len(span) > 1 else span[0]
+        tasks.append(
+            asyncio.create_task(
+                _probe_span(merged, client, settings, semaphore, on_candidate, on_probe)
+            )
         )
+
+    def flush_run(run: list[int]) -> None:
+        for k in range(0, len(run), settings.scout_max_span_chunks):
+            launch(run[k : k + settings.scout_max_span_chunks])
+
+    def handle_scores(batch_pairs: list, batch_scores: list) -> None:
+        if emit is not None:
+            emit(
+                {
+                    "type": "scored",
+                    "corridors": [
+                        {
+                            "entry": {"lat": p[0][0], "lng": p[0][1]},
+                            "exit": {"lat": p[1][0], "lng": p[1][1]},
+                            "curvy_km": round(s, 1),
+                        }
+                        for p, s in zip(batch_pairs, batch_scores)
+                    ],
+                }
+            )
+        batch = sorted(
+            (index_by_pair[p], s) for p, s in zip(batch_pairs, batch_scores)
+        )
+        run: list[int] = []
+        for i, score in batch:
+            live_scores[i] = score
+            contiguous = (
+                run
+                and chunks[i].stretch_id == chunks[run[-1]].stretch_id
+                and chunks[i].step_start == chunks[run[-1]].step_end
+            )
+            if score >= prompt_avg:
+                if run and not contiguous:
+                    flush_run(run)
+                    run = []
+                run.append(i)
+            else:
+                flush_run(run)
+                run = []
+        flush_run(run)
+
+    if settings.osm_enabled and not settings.ihh_mock:
+        scores = await osm.score_chunks(pairs, settings, on_batch=handle_scores)
     else:
         scores = [None] * len(chunks)
-    spans = _plan_probe_spans(
-        chunks,
-        scores,
-        settings.scout_max_probes,
-        settings.osm_min_curvy_km,
-        settings.scout_max_span_chunks,
-    )
-    if len(spans) < len(chunks):
-        logger.info(
-            "scout: probing %d spans over %d corridors (OSM-ranked)", len(spans), len(chunks)
+    for i, score in enumerate(scores):
+        if score is not None:
+            live_scores[i] = score
+
+    # Final pass: rank whatever wasn't clearly good enough to launch immediately.
+    remaining = [(i, c) for i, c in enumerate(chunks) if i not in launched]
+    if remaining and budget > 0:
+        spans = _plan_probe_spans(
+            [c for _, c in remaining],
+            [live_scores.get(i) for i, _ in remaining],
+            budget,
+            settings.osm_min_curvy_km,
+            settings.scout_max_span_chunks,
         )
-    return spans
+        for span in spans:
+            indices = [
+                i
+                for i, c in enumerate(chunks)
+                if span.step_start <= c.step_start and c.step_end <= span.step_end
+            ]
+            launch(indices)
+    if emit is not None:
+        emit({"type": "probing", "count": len(tasks)})
+    logger.info("scout: %d probes over %d corridors", len(tasks), len(chunks))
+
+    results = await asyncio.gather(*tasks) if tasks else []
+    return [c for c in results if c is not None]
 
 
 def _cut_fields(c: _Candidate, steps: Sequence[GStep]) -> dict:
@@ -766,10 +848,6 @@ async def scout(
                 ],
             }
         )
-    chunks = await _select_scout_chunks(chunks, settings, emit)
-    if emit is not None:
-        emit({"type": "probing", "count": len(chunks)})
-
     on_candidate = None
     on_probe = None
     if emit is not None:
@@ -788,9 +866,7 @@ async def scout(
                 }
             )
 
-    candidates = await _query_detours(
-        chunks, client, settings, on_candidate=on_candidate, on_probe=on_probe
-    )
+    candidates = await _scout_probes(chunks, client, settings, emit, on_candidate, on_probe)
     candidates = sorted(candidates, key=lambda c: c.chunk.step_start)
 
     skeleton = _build_skeleton(steps, factors, flags, candidates)

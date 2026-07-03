@@ -37,14 +37,16 @@ function buildRows(progress: ScoutProgress): Row[] {
             : '…',
     },
     {
+      // Probes launch as soon as good corridors score, so cuts can arrive while
+      // the scan row is still running.
       label: 'Pricing detours',
-      state: progress.probeCount !== null ? 'active' : 'pending',
+      state: progress.probeCount !== null || progress.cuts.length > 0 ? 'active' : 'pending',
       value:
-        progress.probeCount !== null
-          ? progress.cuts.length > 0
-            ? `${progress.cuts.length} cut${progress.cuts.length === 1 ? '' : 's'} found`
-            : `probing ${progress.probeCount} corridors`
-          : '…',
+        progress.cuts.length > 0
+          ? `${progress.cuts.length} cut${progress.cuts.length === 1 ? '' : 's'} found`
+          : progress.probeCount !== null
+            ? `probing ${progress.probeCount} corridors`
+            : '…',
     },
   ]
 }
