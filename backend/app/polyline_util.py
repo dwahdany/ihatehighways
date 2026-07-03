@@ -60,6 +60,40 @@ def point_at_fraction(points: Sequence[Point], fraction: float) -> Point:
     return points[-1]
 
 
+def point_to_path_m(p: Point, pts: Sequence[Point]) -> float:
+    """Min distance from p to a polyline's SEGMENTS (not just vertices).
+
+    Vertex-only distance breaks on straight roads: encoded polylines put no interior
+    vertices on straight geometry, so a point mid-segment can sit "far" from every
+    vertex while lying exactly on the path. Equirectangular projection around p is
+    accurate at the sub-km scales this is used for.
+    """
+    if not pts:
+        return float("inf")
+    if len(pts) == 1:
+        return haversine_m(p, pts[0])
+    kx = 111_320.0 * math.cos(math.radians(p[0]))
+    ky = 110_540.0
+    best = float("inf")
+    ax = (pts[0][1] - p[1]) * kx
+    ay = (pts[0][0] - p[0]) * ky
+    for q in pts[1:]:
+        bx = (q[1] - p[1]) * kx
+        by = (q[0] - p[0]) * ky
+        dx, dy = bx - ax, by - ay
+        seg_len2 = dx * dx + dy * dy
+        if seg_len2 <= 1e-9:
+            d2 = ax * ax + ay * ay
+        else:
+            t = max(0.0, min(1.0, -(ax * dx + ay * dy) / seg_len2))
+            cx, cy = ax + t * dx, ay + t * dy
+            d2 = cx * cx + cy * cy
+        if d2 < best:
+            best = d2
+        ax, ay = bx, by
+    return math.sqrt(best)
+
+
 def initial_bearing_deg(p1: Point, p2: Point) -> int:
     """Initial great-circle bearing from p1 to p2 as an int in [0, 360]. 0 = N, 90 = E."""
     lat1, lon1 = math.radians(p1[0]), math.radians(p1[1])

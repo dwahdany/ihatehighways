@@ -1,6 +1,14 @@
 from app import polyline_util
 
 
+def test_point_to_path_measures_segments_not_vertices():
+    path = [(50.0, 7.0), (50.0, 7.5)]  # one straight ~35 km segment, no interior vertices
+    assert polyline_util.point_to_path_m((50.0, 7.25), path) < 5
+    off = (50.01, 7.25)  # ~1.1 km north of the segment
+    assert 1000 < polyline_util.point_to_path_m(off, path) < 1300
+    assert polyline_util.point_to_path_m((50.0, 7.25), []) == float("inf")
+
+
 def test_encode_decode_roundtrip():
     points = [(50.94, 6.96), (50.7213, 7.20111), (50.11, 8.68)]
     encoded = polyline_util.encode(points)

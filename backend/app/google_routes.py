@@ -30,6 +30,15 @@ FIELD_MASK = (
     "routes.legs.steps.startLocation,routes.legs.steps.endLocation"
 )
 
+# Mask for route-token requests (Navigation SDK handoff): the overview polyline is
+# enough for the fidelity check, plus routes.routeToken itself. FIELD_MASK above must
+# stay unchanged for the planner's step-level calls.
+TOKEN_FIELD_MASK = (
+    "routes.routeToken,"
+    "routes.duration,routes.staticDuration,routes.distanceMeters,"
+    "routes.polyline.encodedPolyline"
+)
+
 
 class UpstreamError(Exception):
     """Non-200 response or an {"error": ...} body from the Routes API."""
@@ -191,6 +200,38 @@ class GoogleRoutesClient:
         """Up to 3 route alternatives — same billable request, more candidates to score."""
         return await self._request(origin, destination, avoid_highways, origin_heading, True)
 
+    async def compute_route_token(
+        self,
+        origin: WaypointSpec,
+        destination: WaypointSpec,
+        intermediates: list[Point],
+    ) -> tuple[str, GRoute]:
+        """Fresh route token for the Navigation SDK, plus the tokenized route itself.
+
+        Token requirements (verified against the 2026 Routes API docs): travelMode
+        DRIVE, routingPreference TRAFFIC_AWARE, and intermediates must be REGULAR
+        STOPOVER waypoints — "via": true is FORBIDDEN with tokens. No routeModifiers.
+        Tokens are only valid for minutes: never cache the result.
+        """
+        body = {
+            "origin": origin.to_json(),
+            "destination": destination.to_json(),
+            "intermediates": [
+                {"location": {"latLng": {"latitude": p[0], "longitude": p[1]}}}
+                for p in intermediates
+            ],
+            # NEVER TWO_WHEELER: it is a pricier Enterprise SKU and adds nothing here.
+            "travelMode": "DRIVE",
+            "routingPreference": "TRAFFIC_AWARE",
+            "polylineQuality": "HIGH_QUALITY",
+            "languageCode": "en-US",
+            "units": "METRIC",
+            # NEVER set departureTime: omitted means "now"; a past timestamp errors.
+        }
+        resp = await self._post(body, TOKEN_FIELD_MASK)
+        raw = self._raw_routes(resp)[0]
+        return str(raw.get("routeToken") or ""), _parse_route(raw)
+
     async def _request(
         self,
         origin: WaypointSpec,
@@ -214,10 +255,15 @@ class GoogleRoutesClient:
         if alternatives:
             # Not allowed with intermediates (we never send any); one billable request.
             body["computeAlternativeRoutes"] = True
+        resp = await self._post(body, FIELD_MASK)
+        return self._handle_response(resp)
+
+    async def _post(self, body: dict, field_mask: str) -> httpx.Response:
+        """POST with the retry policy (2 retries on timeout/5xx)."""
         headers = {
             "Content-Type": "application/json",
             "X-Goog-Api-Key": self._api_key,
-            "X-Goog-FieldMask": FIELD_MASK,
+            "X-Goog-FieldMask": field_mask,
         }
         for attempt in range(self._max_retries + 1):
             try:
@@ -230,11 +276,11 @@ class GoogleRoutesClient:
             if resp.status_code >= 500 and attempt < self._max_retries:
                 await asyncio.sleep(0.2 * (attempt + 1))
                 continue
-            return self._handle_response(resp)
+            return resp
         raise UpstreamError(502, "Routes API unavailable")  # pragma: no cover
 
     @staticmethod
-    def _handle_response(resp: httpx.Response) -> list[GRoute]:
+    def _raw_routes(resp: httpx.Response) -> list[dict]:
         try:
             data = resp.json()
         except ValueError:
@@ -247,7 +293,11 @@ class GoogleRoutesClient:
         routes = data.get("routes") or []
         if not routes:
             raise NoRouteError("Routes API returned no routes")
-        return [_parse_route(r) for r in routes]
+        return routes
+
+    @staticmethod
+    def _handle_response(resp: httpx.Response) -> list[GRoute]:
+        return [_parse_route(r) for r in GoogleRoutesClient._raw_routes(resp)]
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +410,38 @@ class MockRoutesClient:
             self._detour_route(p1, p2, _DETOUR_OFFSET_FRACTION, _DETOUR_KMH),
             self._detour_route(p1, p2, _DETOUR_OFFSET_FRACTION * 2, _DETOUR_KMH - 7),
         ]
+
+    async def compute_route_token(
+        self,
+        origin: WaypointSpec,
+        destination: WaypointSpec,
+        intermediates: list[Point],
+    ) -> tuple[str, GRoute]:
+        """("mock-route-token", synthetic route through origin, every intermediate, and
+        destination in order — dense straight segments so pins verifiably lie ON it)."""
+        p1 = origin.lat_lng or _COLOGNE
+        p2 = destination.lat_lng or _FRANKFURT
+        stops: list[Point] = [p1, *intermediates, p2]
+        pts: list[Point] = [stops[0]]
+        for a, b in zip(stops, stops[1:]):
+            n = max(1, math.ceil(polyline_util.haversine_m(a, b) / _SAMPLE_M))
+            for k in range(1, n + 1):
+                t = k / n
+                pts.append((a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t))
+        length = polyline_util.path_length_m(pts)
+        static = length / (_DETOUR_KMH / 3.6)
+        encoded = polyline_util.encode(pts)
+        step = GStep(
+            distance_m=round(length),
+            static_duration_s=static,
+            encoded_polyline=encoded,
+            maneuver="DEPART",
+            instructions="Follow the ride",
+            start=pts[0],
+            end=pts[-1],
+        )
+        leg = GLeg(static, static, round(length), [step])
+        return "mock-route-token", GRoute(static, static, round(length), encoded, [leg])
 
     @staticmethod
     def _build_base() -> GRoute:

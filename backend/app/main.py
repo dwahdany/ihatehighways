@@ -13,8 +13,16 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from .config import Settings
 from .google_routes import GoogleRoutesClient, MockRoutesClient
-from .models import PlanRequest, PlanResponse, ScoutRequest, ScoutResponse
+from .models import (
+    PlanRequest,
+    PlanResponse,
+    RideTokenRequest,
+    RideTokenResponse,
+    ScoutRequest,
+    ScoutResponse,
+)
 from .planner import PlanError, TTLCache, plan, scout, scout_events
+from .ridetoken import build_ride_token
 from .ratelimit import RateLimiter
 
 logger = logging.getLogger("ihatehighways.main")
@@ -160,6 +168,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 yield json.dumps(event, separators=(",", ":")) + "\n"
 
         return StreamingResponse(stream(), media_type="application/x-ndjson", headers=headers)
+
+    @app.post("/api/ride-token", response_model=RideTokenResponse)
+    async def ride_token(req: RideTokenRequest, request: Request) -> RideTokenResponse:
+        # 1-3 paid Google calls, and tokens must be fresh (Google: use within
+        # minutes) — rate limited, NEVER cached.
+        check_rate_limit(request)
+        try:
+            return await build_ride_token(req, client, settings)
+        except PlanError as exc:
+            raise HTTPException(
+                status_code=exc.status,
+                detail={"code": exc.code, "message": exc.message},
+            )
 
     return app
 

@@ -96,3 +96,6 @@ class Settings(BaseSettings):
     osm_deadline_max_s: float = 18.0
     knapsack_bucket_s: int = 15
     cache_ttl_s: int = 240
+    # /api/ride-token fidelity check: a cut counts as followed when >= 7 of 9 samples
+    # along its polyline sit within this distance of the tokenized route.
+    token_fidelity_m: float = 800.0

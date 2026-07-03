@@ -120,3 +120,29 @@ class ScoutResponse(BaseModel):
     fastest: RouteSummary
     skeleton: list[SkeletonPart]
     cuts: list[CutOut]
+
+
+class CutPin(BaseModel):
+    """A selected cut as pinned for the Navigation SDK handoff (route order)."""
+
+    entry: LatLng
+    mid: LatLng
+    exit: LatLng
+    encoded_polyline: str = Field(..., min_length=1)
+
+
+class RideTokenRequest(BaseModel):
+    origin: LatLng
+    destination: LatLng
+    cuts: list[CutPin] = Field(default_factory=list, max_length=12)
+
+
+class RideTokenResponse(BaseModel):
+    route_token: str
+    encoded_polyline: str
+    duration_s: int
+    distance_m: int
+    # The FINAL stopover list in route order; the iOS app must pass exactly these
+    # (with the token) to the Navigation SDK.
+    waypoints: list[LatLng]
+    cuts_followed: list[bool]

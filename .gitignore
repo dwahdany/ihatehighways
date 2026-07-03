@@ -15,8 +15,16 @@ backend/.cache/
 node_modules/
 dist/
 
+# ios
+ios/Secrets.xcconfig
+xcuserdata/
+DerivedData/
+.build/
+*.xcuserstate
+
 # os / editor
 .DS_Store
 .idea/
 .vscode/
 .wrangler/
+ios/*.xcodeproj

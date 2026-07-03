@@ -145,6 +145,44 @@ line) so clients can build the map live:
 Cached scouts replay as a single `done` event. Rate limiting and validation errors are
 returned as normal HTTP errors before the stream starts.
 
+## `POST /api/ride-token`
+
+Fidelity-verified Google route token for the Navigation SDK (iOS app's Ride screen).
+
+Request (`cuts` in route order, max 12):
+
+```json
+{
+  "origin": { "lat": 50.94, "lng": 6.96 },
+  "destination": { "lat": 50.11, "lng": 8.68 },
+  "cuts": [
+    { "entry": {…}, "mid": {…}, "exit": {…}, "encoded_polyline": "…" }
+  ]
+}
+```
+
+Response `200`:
+
+```json
+{
+  "route_token": "…",
+  "encoded_polyline": "…",
+  "duration_s": 27180,
+  "distance_m": 421000,
+  "waypoints": [{ "lat": …, "lng": … }],
+  "cuts_followed": [true, false]
+}
+```
+
+The backend pins each cut by midpoint, requests a token (`computeRoutes` with regular
+stopover intermediates — `via` is forbidden with tokens), and verifies the returned
+route actually follows every cut (9 samples per cut against the tokenized route's
+segments, ≥7 within `TOKEN_FIDELITY_M`, default 800 m). Unfollowed cuts get entry/exit
+pinned and it retries — up to 3 paid attempts, ≤25 intermediates. `waypoints` is the
+final stopover list ENDING WITH the destination: the client must pass exactly these,
+with the token, to the Navigation SDK. Tokens expire within minutes — never cached,
+rate-limited like plans. Same error envelope.
+
 ## `GET /api/health`
 
 ```json

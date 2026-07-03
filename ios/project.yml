@@ -1,0 +1,47 @@
+name: ihatehighways
+options:
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+
+packages:
+  GoogleNavigation:
+    url: https://github.com/googlemaps/ios-navigation-sdk
+    exactVersion: 10.15.0
+
+targets:
+  ihatehighways:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - Sources
+    dependencies:
+      # The Navigation SDK package pulls the Maps SDK (GMSMapView) transitively;
+      # do NOT also add the standalone Maps SDK package.
+      - package: GoogleNavigation
+        product: GoogleNavigation
+    configFiles:
+      Debug: Secrets.xcconfig
+      Release: Secrets.xcconfig
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: eu.wahdany.ihatehighways
+        MARKETING_VERSION: 0.1.0
+        CURRENT_PROJECT_VERSION: 1
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1"
+        INFOPLIST_KEY_UIUserInterfaceStyle: Dark
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: ihatehighways
+        UILaunchScreen: {}
+        UIUserInterfaceStyle: Dark
+        # Build-setting substitution: MAPS_API_KEY comes from Secrets.xcconfig.
+        MAPS_API_KEY: $(MAPS_API_KEY)
+        NSLocationWhenInUseUsageDescription: "Your position keeps turn-by-turn guidance on the twisty route you picked — no location, no ride."
+        NSLocationAlwaysAndWhenInUseUsageDescription: "Guidance keeps running with the phone pocketed or the screen off mid-ride; that needs location access even in the background."
+        UIBackgroundModes:
+          - audio
+          - location
