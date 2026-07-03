@@ -13,6 +13,14 @@ import type {
   SkeletonPart,
 } from '../api'
 
+export interface TestedProbe {
+  id: number
+  encoded_polyline: string
+  kept: boolean
+  /** Client receive time (ms) — drives the fade-out of rejected probes. */
+  at: number
+}
+
 export interface ScoutProgress {
   fastest: FastestRoute | null
   preview: SkeletonPart[]
@@ -22,6 +30,7 @@ export interface ScoutProgress {
   corridors: CorridorRef[]
   scored: ScoredCorridor[]
   probeCount: number | null
+  probes: TestedProbe[]
   cuts: Cut[]
 }
 
@@ -34,8 +43,12 @@ export const EMPTY_PROGRESS: ScoutProgress = {
   corridors: [],
   scored: [],
   probeCount: null,
+  probes: [],
   cuts: [],
 }
+
+const MAX_PROBES_SHOWN = 24
+let probeSequence = 0
 
 /** Fold one stream event into the progress state (done/error handled by the caller). */
 export function applyEvent(progress: ScoutProgress, event: ScoutEvent): ScoutProgress {
@@ -54,6 +67,19 @@ export function applyEvent(progress: ScoutProgress, event: ScoutEvent): ScoutPro
       return { ...progress, scored: [...progress.scored, ...event.corridors] }
     case 'probing':
       return { ...progress, probeCount: event.count }
+    case 'probe':
+      return {
+        ...progress,
+        probes: [
+          ...progress.probes.slice(-MAX_PROBES_SHOWN),
+          {
+            id: probeSequence++,
+            encoded_polyline: event.encoded_polyline,
+            kept: event.kept,
+            at: Date.now(),
+          },
+        ],
+      }
     case 'cut':
       return { ...progress, cuts: [...progress.cuts, event.cut] }
     default:

@@ -187,6 +187,8 @@ export type ScoutEvent =
   | { type: 'corridors'; count: number; corridors: CorridorRef[] }
   | { type: 'scored'; corridors: ScoredCorridor[] }
   | { type: 'probing'; count: number }
+  /** Every tested detour; kept=false ones flash on the map and fade away. */
+  | { type: 'probe'; encoded_polyline: string; kept: boolean }
   | { type: 'cut'; cut: Cut }
   | { type: 'done'; scout: ScoutResponse }
   | { type: 'error'; code: string; message: string; status: number }

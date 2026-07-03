@@ -49,6 +49,10 @@ class Settings(BaseSettings):
     scout_chunk_km: float = 25.0
     # Paid Google detour probes per scout (the OSM ranking chooses which chunks).
     scout_max_probes: int = 12
+    # Consecutive well-scoring corridors merge into one big cut candidate (a
+    # continuously curvy region like the Pfälzerwald becomes a single ~75 km sweep,
+    # for a single probe) — without this, long rides only ever get 25 km nibbles.
+    scout_max_span_chunks: int = 3
     # Raw candidate corridors before OSM ranking; chunk size only grows beyond this
     # (a 2000 km highway haul still yields 48 x ~42 km corridors, not 10 x 200 km).
     scout_max_raw_chunks: int = 48

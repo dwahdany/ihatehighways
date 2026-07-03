@@ -56,19 +56,56 @@ def test_scout_cut_pricing_is_composable():
         assert cut.road == "A3"
 
 
-def test_pick_by_scores_ranks_and_fails_open():
-    from app.planner import _pick_by_scores
+def make_chunk(i: int, stretch: int = 0):
+    from app.classify import Chunk
 
-    # Known-bad corridors dropped; best known scores win the probe budget.
-    scores = [0.5, 10.0, 5.0, None, 8.0, 1.0]
-    assert _pick_by_scores(6, scores, max_probes=2, min_curvy_km=2.0) == [1, 4]
-    # All-unknown (Overpass down) degrades to even sampling along the route.
-    picked = _pick_by_scores(10, [None] * 10, max_probes=3, min_curvy_km=2.0)
-    assert len(picked) == 3
-    assert picked == sorted(picked)
-    assert picked[-1] - picked[0] >= 5  # spread, not the first three
-    # Under budget: everything eligible is probed, known-bad still dropped.
-    assert _pick_by_scores(3, [None, 5.0, 1.0], max_probes=12, min_curvy_km=2.0) == [0, 1]
+    return Chunk(
+        stretch_id=stretch,
+        step_start=i * 2,
+        step_end=i * 2 + 2,
+        distance_m=25_000,
+        static_duration_s=800.0,
+        baseline_s=800.0,
+        entry=(50.0 + i * 0.2, 7.0),
+        exit=(50.2 + i * 0.2, 7.0),
+        entry_heading=0,
+    )
+
+
+def test_plan_probe_spans_merges_good_neighbors():
+    from app.planner import _plan_probe_spans
+
+    chunks = [make_chunk(i) for i in range(6)]
+    scores = [5.0, 6.0, 7.0, 8.0, 0.5, None]
+    spans = _plan_probe_spans(chunks, scores, max_probes=12, min_curvy_km=2.0, max_span=3)
+    ranges = [(s.step_start, s.step_end) for s in spans]
+    assert (0, 6) in ranges  # chunks 0-2 merged into one 75 km sweep
+    assert (6, 8) in ranges  # chunk 3, the run remainder
+    assert all(not (r[0] <= 8 < r[1]) for r in ranges)  # known-bad chunk 4 dropped
+    assert (10, 12) in ranges  # unknown chunk 5 probed blind
+    merged = next(s for s in spans if (s.step_start, s.step_end) == (0, 6))
+    assert merged.distance_m == 75_000
+    assert merged.baseline_s == 2400.0
+    assert merged.entry == chunks[0].entry and merged.exit == chunks[2].exit
+
+
+def test_plan_probe_spans_ranks_by_total_curvy_and_caps():
+    from app.planner import _plan_probe_spans
+
+    chunks = [make_chunk(i) for i in range(8)]
+    scores = [10.0, 0.1, 3.0, 0.1, 7.0, 0.1, None, None]
+    spans = _plan_probe_spans(chunks, scores, max_probes=2, min_curvy_km=2.0, max_span=3)
+    # Top-2 isolated known spans by score (10.0 and 7.0), returned in route order.
+    assert [(s.step_start, s.step_end) for s in spans] == [(0, 2), (8, 10)]
+
+
+def test_plan_probe_spans_blind_pairs_when_unscored():
+    from app.planner import _plan_probe_spans
+
+    chunks = [make_chunk(i) for i in range(6)]
+    spans = _plan_probe_spans(chunks, [None] * 6, max_probes=12, min_curvy_km=2.0, max_span=3)
+    # Overpass down: pairs, so bigger options still exist.
+    assert [(s.step_start, s.step_end) for s in spans] == [(0, 4), (4, 8), (8, 12)]
 
 
 def test_scout_chunks_stay_small_on_long_routes():
@@ -123,8 +160,8 @@ def test_scout_long_haul_caps_probes_and_chunk_sizes():
     assert 0 < len(resp.cuts) <= SETTINGS.scout_max_probes
     parts_by_cut = {p.cut_id: p for p in resp.skeleton if p.cut_id}
     for cut in resp.cuts:
-        # Chunk sizes must stay near scout_chunk_km on any route length.
-        assert parts_by_cut[cut.id].distance_m <= SETTINGS.scout_chunk_km * 1000 * 1.1
+        # Unscored corridors probe as blind pairs at most: <= 2 chunks per cut.
+        assert parts_by_cut[cut.id].distance_m <= SETTINGS.scout_chunk_km * 2 * 1000 * 1.1
     # Probes spread along the haul, not clustered at the start.
     firsts = [p.cut_id is not None for p in resp.skeleton]
     assert any(firsts[len(firsts) // 2 :])
@@ -161,6 +198,11 @@ def test_scout_stream_events():
         assert len(cut_events) == len(done["cuts"]) > 0
         for e in cut_events:
             assert e["cut"]["avoided_highway_s"] > 0
+        # Every tested detour streams a probe event; kept ones match the cuts.
+        probe_events = [e for e in events if e["type"] == "probe"]
+        assert len(probe_events) >= len(cut_events)
+        assert sum(1 for e in probe_events if e["kept"]) == len(cut_events)
+        assert all(e["encoded_polyline"] for e in probe_events)
 
         # Second call replays the cached result as a single done event.
         with client.stream("POST", "/api/scout/stream", json=body) as resp2:

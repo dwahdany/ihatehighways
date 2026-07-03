@@ -206,6 +206,22 @@ def chunk_size_m(settings: Settings, budget_s: float | None) -> float:
     return chunk_km * 1000
 
 
+def merge_chunks(run: Sequence[Chunk]) -> Chunk:
+    """Merge contiguous chunks of one stretch into a single bigger candidate."""
+    first, last = run[0], run[-1]
+    return Chunk(
+        stretch_id=first.stretch_id,
+        step_start=first.step_start,
+        step_end=last.step_end,
+        distance_m=sum(c.distance_m for c in run),
+        static_duration_s=sum(c.static_duration_s for c in run),
+        baseline_s=sum(c.baseline_s for c in run),
+        entry=first.entry,
+        exit=last.exit,
+        entry_heading=first.entry_heading,
+    )
+
+
 def road_name(steps: Sequence[GStep], start: int, end: int) -> str | None:
     """Most common motorway name in the instruction texts of steps [start, end)."""
     counts: dict[str, int] = {}

@@ -136,6 +136,7 @@ line) so clients can build the map live:
 {"type":"corridors", "count":39, "corridors":[{"entry":…, "exit":…}…]}
 {"type":"scored", "corridors":[{"entry":…, "exit":…, "curvy_km":8.4}…]}                 // per OSM batch; absent when OSM is off
 {"type":"probing", "count":12}
+{"type":"probe", "encoded_polyline":"…", "kept":false}                                  // every tested detour; rejects fade on the client map
 {"type":"cut", "cut":CutOut}                                                            // per gated probe, id empty, order nondeterministic
 {"type":"done", "scout":ScoutResponse}                                                  // authoritative final payload
 {"type":"error", "code":…, "message":…, "status":…}                                     // terminal instead of done

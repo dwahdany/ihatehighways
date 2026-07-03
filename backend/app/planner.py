@@ -173,6 +173,7 @@ async def _query_detours(
     client: RoutesClient,
     settings: Settings,
     on_candidate: Callable[[_Candidate], None] | None = None,
+    on_probe: Callable[[GRoute, bool], None] | None = None,
 ) -> list[_Candidate]:
     semaphore = asyncio.Semaphore(MAX_PARALLEL_DETOUR_QUERIES)
 
@@ -236,6 +237,8 @@ async def _query_detours(
                 )
                 return None
         candidate = evaluate(chunk, route)
+        if on_probe is not None:
+            on_probe(route, candidate is not None)
         if candidate is not None and on_candidate is not None:
             on_candidate(candidate)
         return candidate
@@ -572,28 +575,66 @@ def _build_skeleton(
     ]
 
 
-def _pick_by_scores(
-    count: int, scores: Sequence[float | None], max_probes: int, min_curvy_km: float
-) -> list[int]:
-    """Choose which corridors get a paid Google probe, by OSM curvy score.
+def _plan_probe_spans(
+    chunks: Sequence[Chunk],
+    scores: Sequence[float | None],
+    max_probes: int,
+    min_curvy_km: float,
+    max_span: int,
+) -> list[Chunk]:
+    """Turn scored corridors into probe candidates, merging good neighbors.
 
-    Known-bad corridors (score < threshold) are dropped; the rest are ranked by score.
-    Unknown scores (Overpass gaps) fail open and fill leftover probe slots evenly
-    spread along the route, so a dead Overpass degrades to uniform sampling.
+    Runs of consecutive well-scoring corridors merge into spans of up to max_span
+    chunks — a continuously curvy region becomes one big sweep for one probe. Unknown
+    scores (Overpass gaps) fail open as blind pairs, so bigger options exist even when
+    scoring is down. Known-bad corridors are dropped. Known spans are ranked by total
+    curvy km; unknown spans fill leftover probe slots evenly spread along the route.
     """
-    eligible = [i for i in range(count) if scores[i] is None or scores[i] >= min_curvy_km]
-    if len(eligible) <= max_probes:
-        return eligible
-    known = sorted(
-        (i for i in eligible if scores[i] is not None), key=lambda i: -float(scores[i] or 0)
-    )
-    picked = set(known[:max_probes])
+    known_spans: list[tuple[list[Chunk], float]] = []
+    unknown_spans: list[list[Chunk]] = []
+    i = 0
+    n = len(chunks)
+    while i < n:
+        score = scores[i]
+        if score is not None and score < min_curvy_km:
+            i += 1
+            continue
+        known = score is not None
+        run: list[tuple[Chunk, float]] = [(chunks[i], score or 0.0)]
+        j = i + 1
+        while j < n:
+            next_score = scores[j]
+            same_kind = (
+                (next_score is not None and next_score >= min_curvy_km)
+                if known
+                else next_score is None
+            )
+            contiguous = (
+                chunks[j].stretch_id == run[-1][0].stretch_id
+                and chunks[j].step_start == run[-1][0].step_end
+            )
+            if not same_kind or not contiguous:
+                break
+            run.append((chunks[j], next_score or 0.0))
+            j += 1
+        size = max_span if known else 2
+        for k in range(0, len(run), size):
+            span = run[k : k + size]
+            if known:
+                known_spans.append(([c for c, _ in span], sum(s for _, s in span)))
+            else:
+                unknown_spans.append([c for c, _ in span])
+        i = j
+
+    known_spans.sort(key=lambda item: -item[1])
+    picked: list[list[Chunk]] = [span for span, _ in known_spans[:max_probes]]
     slots = max_probes - len(picked)
-    unknown = [i for i in eligible if scores[i] is None]
-    if slots > 0 and unknown:
-        stride = max(1, len(unknown) // slots)
-        picked.update(unknown[::stride][:slots])
-    return sorted(picked)
+    if slots > 0 and unknown_spans:
+        stride = max(1, len(unknown_spans) // slots)
+        picked.extend(unknown_spans[::stride][:slots])
+    merged = [classify.merge_chunks(span) for span in picked]
+    merged.sort(key=lambda c: c.step_start)
+    return merged
 
 
 async def _select_scout_chunks(
@@ -625,12 +666,18 @@ async def _select_scout_chunks(
         )
     else:
         scores = [None] * len(chunks)
-    indices = _pick_by_scores(
-        len(chunks), scores, settings.scout_max_probes, settings.osm_min_curvy_km
+    spans = _plan_probe_spans(
+        chunks,
+        scores,
+        settings.scout_max_probes,
+        settings.osm_min_curvy_km,
+        settings.scout_max_span_chunks,
     )
-    if len(indices) < len(chunks):
-        logger.info("scout: probing %d of %d corridors (OSM-ranked)", len(indices), len(chunks))
-    return [chunks[i] for i in indices]
+    if len(spans) < len(chunks):
+        logger.info(
+            "scout: probing %d spans over %d corridors (OSM-ranked)", len(spans), len(chunks)
+        )
+    return spans
 
 
 def _cut_fields(c: _Candidate, steps: Sequence[GStep]) -> dict:
@@ -724,13 +771,26 @@ async def scout(
         emit({"type": "probing", "count": len(chunks)})
 
     on_candidate = None
+    on_probe = None
     if emit is not None:
 
         def on_candidate(c: _Candidate) -> None:
             fields = _cut_fields(c, steps)
             emit({"type": "cut", "cut": CutOut(id="", **fields).model_dump(mode="json")})
 
-    candidates = await _query_detours(chunks, client, settings, on_candidate=on_candidate)
+        def on_probe(route: GRoute, kept: bool) -> None:
+            # Every tested detour flashes on the client map; rejects fade away.
+            emit(
+                {
+                    "type": "probe",
+                    "encoded_polyline": route.encoded_polyline,
+                    "kept": kept,
+                }
+            )
+
+    candidates = await _query_detours(
+        chunks, client, settings, on_candidate=on_candidate, on_probe=on_probe
+    )
     candidates = sorted(candidates, key=lambda c: c.chunk.step_start)
 
     skeleton = _build_skeleton(steps, factors, flags, candidates)
