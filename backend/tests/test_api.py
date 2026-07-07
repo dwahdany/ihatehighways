@@ -20,7 +20,7 @@ def test_health():
     with make_client() as client:
         resp = client.get("/api/health")
     assert resp.status_code == 200
-    assert resp.json() == {"ok": True, "mock": True}
+    assert resp.json() == {"ok": True, "mock": True, "key_configured": True}
 
 
 def test_plan_happy_path_matches_contract():

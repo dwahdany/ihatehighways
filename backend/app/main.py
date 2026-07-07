@@ -83,7 +83,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/health")
     async def health() -> dict:
-        return {"ok": True, "mock": settings.ihh_mock}
+        # key_configured guards against deploys that silently drop the secret (an
+        # assets-only misdeploy once wiped it and health kept reporting ok).
+        return {
+            "ok": True,
+            "mock": settings.ihh_mock,
+            "key_configured": bool(settings.google_maps_api_key) or settings.ihh_mock,
+        }
 
     def check_rate_limit(request: Request) -> None:
         # Cached hits are free; only uncached plans (which cost Google calls) count.
