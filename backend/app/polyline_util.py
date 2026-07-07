@@ -60,6 +60,78 @@ def point_at_fraction(points: Sequence[Point], fraction: float) -> Point:
     return points[-1]
 
 
+def point_at_distance_m(points: Sequence[Point], distance_m: float) -> Point:
+    """The point at `distance_m` along the path, interpolated on the polyline."""
+    if not points:
+        raise ValueError("empty path")
+    if len(points) == 1 or distance_m <= 0:
+        return points[0]
+    acc = 0.0
+    for a, b in zip(points, points[1:]):
+        seg = haversine_m(a, b)
+        if acc + seg >= distance_m and seg > 0:
+            t = (distance_m - acc) / seg
+            return (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
+        acc += seg
+    return points[-1]
+
+
+def bearing_at_distance_m(points: Sequence[Point], distance_m: float) -> int:
+    """Bearing of the polyline segment containing the point at `distance_m`."""
+    if len(points) < 2:
+        return 0
+    acc = 0.0
+    for a, b in zip(points, points[1:]):
+        seg = haversine_m(a, b)
+        if seg > 0 and acc + seg >= distance_m:
+            return initial_bearing_deg(a, b)
+        acc += seg
+    for a, b in zip(reversed(points[:-1]), reversed(points[1:])):
+        if haversine_m(a, b) > 0:
+            return initial_bearing_deg(a, b)
+    return 0
+
+
+def project_arclen_m(p: Point, pts: Sequence[Point]) -> tuple[float, float]:
+    """(arc length at the closest point on the path, distance to it), in meters.
+
+    Same segment-wise equirectangular projection as point_to_path_m; arc lengths
+    accumulate haversine segment lengths so they are comparable to path_length_m.
+    """
+    if not pts:
+        return 0.0, float("inf")
+    if len(pts) == 1:
+        return 0.0, haversine_m(p, pts[0])
+    kx = 111_320.0 * math.cos(math.radians(p[0]))
+    ky = 110_540.0
+    best_d2 = float("inf")
+    best_m = 0.0
+    acc = 0.0
+    ax = (pts[0][1] - p[1]) * kx
+    ay = (pts[0][0] - p[0]) * ky
+    prev = pts[0]
+    for q in pts[1:]:
+        bx = (q[1] - p[1]) * kx
+        by = (q[0] - p[0]) * ky
+        dx, dy = bx - ax, by - ay
+        seg_len2 = dx * dx + dy * dy
+        seg_m = haversine_m(prev, q)
+        if seg_len2 <= 1e-9:
+            t = 0.0
+            d2 = ax * ax + ay * ay
+        else:
+            t = max(0.0, min(1.0, -(ax * dx + ay * dy) / seg_len2))
+            cx, cy = ax + t * dx, ay + t * dy
+            d2 = cx * cx + cy * cy
+        if d2 < best_d2:
+            best_d2 = d2
+            best_m = acc + t * seg_m
+        acc += seg_m
+        ax, ay = bx, by
+        prev = q
+    return best_m, math.sqrt(best_d2)
+
+
 def point_to_path_m(p: Point, pts: Sequence[Point]) -> float:
     """Min distance from p to a polyline's SEGMENTS (not just vertices).
 

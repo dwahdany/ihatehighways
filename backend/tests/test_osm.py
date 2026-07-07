@@ -63,3 +63,60 @@ def test_bbox_pads_both_axes():
     assert south < 50.0 and north > 50.1
     assert west < 7.0 and east > 7.2
     assert 0.03 < 50.0 - south < 0.05  # ~4 km in degrees latitude
+
+
+def test_segment_bboxes_cover_the_polyline():
+    from app.config import Settings
+    from app.osm import _in_box, segment_bboxes
+
+    settings = Settings(_env_file=None)
+    poly = [(50.0 + 0.005 * i, 7.0) for i in range(130)]  # ~72 km due north
+    boxes = segment_bboxes(poly, settings)
+    assert 2 <= len(boxes) <= 4
+    for p in poly:
+        assert any(_in_box(p[0], p[1], b) for b in boxes)
+
+
+def test_fetch_junctions_assigns_caches_and_fails_closed(tmp_path, monkeypatch):
+    import asyncio
+
+    from app import osm
+    from app.config import Settings
+
+    settings = Settings(_env_file=None)
+    monkeypatch.setattr(osm, "JUNCTION_CACHE_FILE", tmp_path / "junctions.json")
+    monkeypatch.setattr(osm, "_junction_cache", None)
+    calls = []
+
+    async def fake_post(query, s, http):
+        calls.append(query)
+        return {
+            "elements": [
+                {"type": "node", "lat": 50.05, "lon": 7.0},
+                {"type": "node", "lat": 58.0, "lon": 12.0},  # far away: other bbox only
+            ]
+        }
+
+    monkeypatch.setattr(osm, "_post_overpass", fake_post)
+    stretch_a = [(50.0 + 0.001 * i, 7.0) for i in range(100)]  # ~11 km north
+    stretch_b = [(58.0, 12.0 + 0.001 * i) for i in range(100)]
+    got = asyncio.run(osm.fetch_junctions([stretch_a, stretch_b], settings))
+    assert got[0] == [(50.05, 7.0)]
+    assert got[1] == [(58.0, 12.0)]
+    assert len(calls) == 1  # both stretches' boxes fit one batched query
+
+    # Second call: served from cache, no network.
+    got2 = asyncio.run(osm.fetch_junctions([stretch_a, stretch_b], settings))
+    assert got2 == got
+    assert len(calls) == 1
+
+    # A dead Overpass yields None (unknown), never an empty junction list.
+    monkeypatch.setattr(osm, "_junction_cache", None)
+    monkeypatch.setattr(osm, "JUNCTION_CACHE_FILE", tmp_path / "empty.json")
+
+    async def dead_post(query, s, http):
+        return None
+
+    monkeypatch.setattr(osm, "_post_overpass", dead_post)
+    got3 = asyncio.run(osm.fetch_junctions([stretch_a], settings))
+    assert got3 == [None]

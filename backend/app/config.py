@@ -50,9 +50,12 @@ class Settings(BaseSettings):
     # Paid Google detour probes per scout (the OSM ranking chooses which chunks).
     scout_max_probes: int = 12
     # Consecutive well-scoring corridors merge into one big cut candidate (a
-    # continuously curvy region like the Pfälzerwald becomes a single ~75 km sweep,
-    # for a single probe) — without this, long rides only ever get 25 km nibbles.
-    scout_max_span_chunks: int = 3
+    # continuously curvy region like the Pfälzerwald becomes a single sweep, for a
+    # single probe) — without this, long rides only ever get exit-sized nibbles.
+    # With junction-gap chunks this is the "exit i -> rejoin within the next ~10
+    # entries" lookahead; scout_max_span_km bounds the sweep when chunks are bigger.
+    scout_max_span_chunks: int = 10
+    scout_max_span_km: float = 80.0
     # Raw candidate corridors before OSM ranking; chunk size only grows beyond this
     # (a 2000 km highway haul still yields 48 x ~42 km corridors, not 10 x 200 km).
     scout_max_raw_chunks: int = 48
@@ -66,6 +69,35 @@ class Settings(BaseSettings):
     # A detour must shed at least this fraction of its chunk's highway time, or it never
     # really left the motorway (soft avoidHighways stays on it when leaving is costly).
     min_avoided_fraction: float = 0.5
+
+    # Junction-aligned chunking: chunk boundaries snap to motorway interchanges (OSM
+    # highway=motorway_junction nodes) so a probe's "take the next exit" is exactly
+    # the exit the boundary names — no ride-past-and-double-back cuts. Falls back to
+    # distance chunking when Overpass has no junction data in time.
+    junction_chunks_enabled: bool = True
+    # Node-to-route projection gate. Our carriageway's junction nodes are vertices of
+    # the way the route polyline traces (<= ~10 m off); the opposite carriageway of a
+    # divided motorway is typically 15-30 m away. 20 m keeps ours and drops most
+    # opposite-direction nodes; erring tight is right — a phantom boundary at an exit
+    # that only exists for oncoming traffic reintroduces the double-back bug, while a
+    # missed exit merely grows one chunk.
+    junction_snap_m: float = 20.0
+    # Junction nodes within this arc-length gap collapse into one interchange (both
+    # directions' ramp nodes plus multi-lane exits cluster within a few hundred m).
+    junction_cluster_m: float = 900.0
+    # Probe origin sits this far upstream of an interchange's first node, so soft
+    # avoidHighways resolves "take the next exit" to that interchange.
+    probe_entry_back_m: float = 250.0
+    # Probe destination sits this far past an interchange's last node, so re-entry at
+    # its on-ramp (which merges downstream of the exit nodes) can reach it.
+    probe_exit_fwd_m: float = 900.0
+    # Scout granularity for junction chunks: exits closer than this coalesce. Keeps
+    # the action space near "every 1-2 exits" while bounding corridor count.
+    scout_junction_gap_km: float = 6.0
+    # How long the junction fetch may delay chunking before affected stretches fall
+    # back to distance boundaries (the disk cache makes warm scouts instant).
+    osm_junction_deadline_s: float = 10.0
+    osm_junction_pad_m: float = 300.0
 
     # OSM corridor pre-filter: skip Google detour probes for chunks with no fun roads
     # nearby (saves ~$ per plan and kills junk urban detours at the source).

@@ -14,7 +14,7 @@ from typing import AsyncIterator, Callable, Protocol, Sequence
 
 Emit = Callable[[dict], None]
 
-from . import classify, gmaps, knapsack, osm, polyline_util
+from . import classify, gmaps, junctions, knapsack, osm, polyline_util
 from .classify import Chunk
 from .config import Settings
 from .google_routes import GRoute, GStep, NoRouteError, UpstreamError, WaypointSpec
@@ -295,6 +295,20 @@ async def _query_detours(
     return [c for c in results if c is not None]
 
 
+def _overlapping_chunks(a: Chunk, b: Chunk) -> bool:
+    """True when two adjacent chunks' probe geometries overlap and can't coexist.
+
+    Junction-aligned chunks overshoot their far interchange (a.exit lies ~1 km past
+    b.entry), so riding detour a and then detour b means rejoining the motorway at an
+    on-ramp and immediately needing the exit BEHIND it — backward waypoints in the
+    handoff and double-counted seconds. Old distance chunks abut exactly (a.exit ==
+    b.entry) and stay combinable.
+    """
+    if a.step_start > b.step_start:
+        a, b = b, a
+    return a.stretch_id == b.stretch_id and a.step_end == b.step_start and a.exit != b.entry
+
+
 def _span_from_candidates(run: Sequence[_Candidate], route: GRoute, settings: Settings) -> _Span:
     hw_s, hw_m = _route_highway_stats(route, settings)
     return _Span(
@@ -371,7 +385,18 @@ async def _merge_spans(
                 total_extra = new_total
                 accepted = True
         if not accepted:
-            spans.extend(_span_from_candidates([c], c.route, settings) for c in run)
+            # Junction chunks in one run overlap pairwise (probe-exit overshoot) —
+            # keep the best non-overlapping subset by worth instead of stitching a
+            # ride that doubles back at every shared interchange.
+            keep: list[_Candidate] = []
+            for cand in sorted(
+                run,
+                key=lambda c: -_worth(c.value_s, c.extra_cost_s, c.curviness, settings),
+            ):
+                if not any(_overlapping_chunks(k.chunk, cand.chunk) for k in keep):
+                    keep.append(cand)
+            keep.sort(key=lambda c: c.chunk.step_start)
+            spans.extend(_span_from_candidates([c], c.route, settings) for c in keep)
     spans.sort(key=lambda s: s.step_start)
     return spans
 
@@ -460,6 +485,70 @@ def _fastest_summary(
     )
 
 
+def _curvy_gate_km(distance_m: float, settings: Settings) -> float:
+    """The OSM curvy-km gate, scaled down only for sub-min_chunk_km corridors.
+
+    Scores grow roughly with the scanned bbox (corridor length + 2x pad). The old
+    system only ever gated corridors >= min_chunk_km, so those keep the flat
+    calibrated osm_min_curvy_km bar (fallback paths behave exactly as before); finer
+    junction chunks get a proportional bar, floored so they still need SOMETHING.
+    """
+    pad_km = 2 * settings.osm_bbox_pad_m / 1000
+    scale = (distance_m / 1000 + pad_km) / (settings.min_chunk_km + pad_km)
+    return settings.osm_min_curvy_km * max(0.4, min(1.0, scale))
+
+
+async def _chunk_route(
+    steps: list[GStep],
+    factors: list[float],
+    flags: list[bool],
+    settings: Settings,
+    junction_gap_m: float,
+    fallback_chunk_m: float,
+    max_chunks: int,
+) -> tuple[list[GStep], list[float], list[bool], list[Chunk]]:
+    """Junction-aligned chunks when junction data arrives in time, else distance chunks.
+
+    May rebuild the step list (steps get sliced at interchange boundaries) — callers
+    must rebind steps/factors/flags to the returned lists.
+    """
+    stretches = classify.find_stretches(steps, flags, settings)
+    if not stretches:
+        return steps, factors, flags, []
+    use_junctions = (
+        settings.junction_chunks_enabled and settings.osm_enabled and not settings.ihh_mock
+    )
+    nodes: list[list[Point] | None] = [None] * len(stretches)
+    if use_junctions:
+        polys = [junctions.stretch_polyline(steps, a, b) for a, b in stretches]
+        try:
+            nodes = await osm.fetch_junctions(polys, settings)
+        except Exception:
+            logger.exception("junction fetch failed; falling back to distance chunking")
+            nodes = [None] * len(stretches)
+    if all(n is None for n in nodes):
+        chunks = classify.build_chunks(
+            steps,
+            flags,
+            factors,
+            settings,
+            chunk_km=fallback_chunk_m / 1000,
+            max_chunks=max_chunks,
+        )
+        return steps, factors, flags, chunks
+    return junctions.align(
+        steps,
+        factors,
+        flags,
+        stretches,
+        nodes,
+        settings,
+        target_m=junction_gap_m,
+        fallback_chunk_m=fallback_chunk_m,
+        max_chunks=max_chunks,
+    )
+
+
 async def _osm_filter(chunks: list[Chunk], settings: Settings) -> list[Chunk]:
     """Drop chunks whose corridors have no fun roads (free OSM data, fails open)."""
     if not chunks or not settings.osm_enabled or settings.ihh_mock:
@@ -472,13 +561,14 @@ async def _osm_filter(chunks: list[Chunk], settings: Settings) -> list[Chunk]:
     )
     kept: list[Chunk] = []
     for chunk, score in zip(chunks, scores):
-        if score is not None and score < settings.osm_min_curvy_km:
+        gate = _curvy_gate_km(chunk.distance_m, settings)
+        if score is not None and score < gate:
             logger.info(
                 "skipping chunk [%d,%d): corridor curvy score %.1f km < %.1f km",
                 chunk.step_start,
                 chunk.step_end,
                 score,
-                settings.osm_min_curvy_km,
+                gate,
             )
             continue
         kept.append(chunk)
@@ -497,9 +587,19 @@ async def plan(req: PlanRequest, client: RoutesClient, settings: Settings) -> Pl
     flags = classify.classify_steps(steps, settings)
     fastest = _fastest_summary(base, steps, factors, flags)
 
-    # 3-4. Stretches -> chunks (budget-adaptively sized) -> OSM pre-filter -> parallel
-    # detour queries (each probe is a paid Google call; OSM gating is free).
-    chunks = classify.build_chunks(steps, flags, factors, settings, budget_s=budget_s)
+    # 3-4. Stretches -> chunks (budget-adaptively sized, boundaries snapped to
+    # motorway interchanges) -> OSM pre-filter -> parallel detour queries (each probe
+    # is a paid Google call; OSM gating is free).
+    chunk_m = classify.chunk_size_m(settings, budget_s)
+    steps, factors, flags, chunks = await _chunk_route(
+        steps,
+        factors,
+        flags,
+        settings,
+        junction_gap_m=chunk_m,
+        fallback_chunk_m=chunk_m,
+        max_chunks=settings.max_chunks,
+    )
     chunks = await _osm_filter(chunks, settings)
     candidates = await _query_detours(chunks, client, settings)
 
@@ -623,28 +723,54 @@ def _build_skeleton(
     ]
 
 
+def _slice_spans(
+    run: list, max_n: int, max_m: float | None, dist: Callable[[object], float]
+) -> list[list]:
+    """Greedy-slice a contiguous run into spans of <= max_n items and <= max_m meters."""
+    out: list[list] = []
+    cur: list = []
+    cur_m = 0.0
+    for item in run:
+        d = dist(item)
+        if cur and (len(cur) >= max_n or (max_m is not None and cur_m + d > max_m)):
+            out.append(cur)
+            cur = []
+            cur_m = 0.0
+        cur.append(item)
+        cur_m += d
+    if cur:
+        out.append(cur)
+    return out
+
+
 def _plan_probe_spans(
     chunks: Sequence[Chunk],
     scores: Sequence[float | None],
     max_probes: int,
     min_curvy_km: float,
     max_span: int,
+    gates: Sequence[float] | None = None,
+    max_span_m: float | None = None,
 ) -> list[Chunk]:
     """Turn scored corridors into probe candidates, merging good neighbors.
 
     Runs of consecutive well-scoring corridors merge into spans of up to max_span
-    chunks — a continuously curvy region becomes one big sweep for one probe. Unknown
-    scores (Overpass gaps) fail open as blind pairs, so bigger options exist even when
-    scoring is down. Known-bad corridors are dropped. Known spans are ranked by total
-    curvy km; unknown spans fill leftover probe slots evenly spread along the route.
+    chunks (and max_span_m meters) — a continuously curvy region becomes one big sweep
+    for one probe. Unknown scores (Overpass gaps) fail open as blind pairs, so bigger
+    options exist even when scoring is down. Known-bad corridors are dropped (each
+    against its own size-scaled gate when `gates` is given). Known spans are ranked by
+    total curvy km; unknown spans fill leftover probe slots evenly spread along the
+    route.
     """
+    if gates is None:
+        gates = [min_curvy_km] * len(chunks)
     known_spans: list[tuple[list[Chunk], float]] = []
     unknown_spans: list[list[Chunk]] = []
     i = 0
     n = len(chunks)
     while i < n:
         score = scores[i]
-        if score is not None and score < min_curvy_km:
+        if score is not None and score < gates[i]:
             i += 1
             continue
         known = score is not None
@@ -653,7 +779,7 @@ def _plan_probe_spans(
         while j < n:
             next_score = scores[j]
             same_kind = (
-                (next_score is not None and next_score >= min_curvy_km)
+                (next_score is not None and next_score >= gates[j])
                 if known
                 else next_score is None
             )
@@ -666,8 +792,7 @@ def _plan_probe_spans(
             run.append((chunks[j], next_score or 0.0))
             j += 1
         size = max_span if known else 2
-        for k in range(0, len(run), size):
-            span = run[k : k + size]
+        for span in _slice_spans(run, size, max_span_m, lambda it: it[0].distance_m):
             if known:
                 known_spans.append(([c for c, _ in span], sum(s for _, s in span)))
             else:
@@ -707,7 +832,7 @@ async def _scout_probes(
     budget = settings.scout_max_probes
     tasks: list[asyncio.Task] = []
     launched: set[int] = set()
-    prompt_avg = settings.osm_min_curvy_km * 2
+    separators: set[int] = set()
     pairs = [(c.entry, c.exit) for c in chunks]
     index_by_pair = {pair: i for i, pair in enumerate(pairs)}
     live_scores: dict[int, float] = {}
@@ -715,6 +840,33 @@ async def _scout_probes(
     def launch(indices: list[int]) -> None:
         nonlocal budget
         if budget <= 0 or any(i in launched for i in indices):
+            return
+        # Junction chunks overshoot their far interchange, so a span adjacent to a
+        # PROBED one gives up its edge chunk as a separator (consumed, never probed)
+        # — otherwise selecting both cuts would double back at the shared interchange.
+        # Separators themselves overlap nothing (their probe never runs), so they
+        # don't propagate the trim to the next chunk.
+        while (
+            indices
+            and indices[0] > 0
+            and indices[0] - 1 in launched
+            and indices[0] - 1 not in separators
+            and _overlapping_chunks(chunks[indices[0] - 1], chunks[indices[0]])
+        ):
+            separators.add(indices[0])
+            launched.add(indices[0])
+            indices = indices[1:]
+        while (
+            indices
+            and indices[-1] + 1 < len(chunks)
+            and indices[-1] + 1 in launched
+            and indices[-1] + 1 not in separators
+            and _overlapping_chunks(chunks[indices[-1]], chunks[indices[-1] + 1])
+        ):
+            separators.add(indices[-1])
+            launched.add(indices[-1])
+            indices = indices[:-1]
+        if not indices:
             return
         budget -= 1
         launched.update(indices)
@@ -727,8 +879,14 @@ async def _scout_probes(
         )
 
     def flush_run(run: list[int]) -> None:
-        for k in range(0, len(run), settings.scout_max_span_chunks):
-            launch(run[k : k + settings.scout_max_span_chunks])
+        spans = _slice_spans(
+            run,
+            settings.scout_max_span_chunks,
+            settings.scout_max_span_km * 1000,
+            lambda i: chunks[i].distance_m,
+        )
+        for span in spans:
+            launch(span)
 
     def handle_scores(batch_pairs: list, batch_scores: list) -> None:
         if emit is not None:
@@ -756,7 +914,7 @@ async def _scout_probes(
                 and chunks[i].stretch_id == chunks[run[-1]].stretch_id
                 and chunks[i].step_start == chunks[run[-1]].step_end
             )
-            if score >= prompt_avg:
+            if score >= 2 * _curvy_gate_km(chunks[i].distance_m, settings):
                 if run and not contiguous:
                     flush_run(run)
                     run = []
@@ -767,7 +925,19 @@ async def _scout_probes(
         flush_run(run)
 
     if settings.osm_enabled and not settings.ihh_mock:
-        scores = await osm.score_chunks(pairs, settings, on_batch=handle_scores)
+        # Scale the bbox-union batch size to corridor size: eager probe runs are
+        # bounded by the OSM batch, and junction chunks (~6 km) have much smaller
+        # bboxes than the 25 km corridors osm_bbox_batch was measured on — without
+        # this, cold-cache scouts could never launch a multi-exit sweep.
+        pad_km = 2 * settings.osm_bbox_pad_m / 1000
+        avg_km = sum(c.distance_m for c in chunks) / len(chunks) / 1000
+        scale = (settings.scout_chunk_km + pad_km) / (avg_km + pad_km)
+        bbox_batch = max(
+            settings.osm_bbox_batch, min(12, round(settings.osm_bbox_batch * scale))
+        )
+        scores = await osm.score_chunks(
+            pairs, settings, on_batch=handle_scores, bbox_batch=bbox_batch
+        )
     else:
         scores = [None] * len(chunks)
     for i, score in enumerate(scores):
@@ -783,6 +953,8 @@ async def _scout_probes(
             budget,
             settings.osm_min_curvy_km,
             settings.scout_max_span_chunks,
+            gates=[_curvy_gate_km(c.distance_m, settings) for _, c in remaining],
+            max_span_m=settings.scout_max_span_km * 1000,
         )
         for span in spans:
             indices = [
@@ -860,15 +1032,19 @@ async def scout(
     total_hw_km = (
         sum(sum(steps[i].distance_m for i in range(a, b)) for a, b in stretches) / 1000.0
     )
-    # Chunk size only grows once even scout_max_raw_chunks corridors can't cover the
-    # highway — never balloons to +70 min cuts just because the route is long.
+    # Junction gaps are the natural action space (exit i -> rejoin j); both the
+    # junction gap and the distance fallback only grow once scout_max_raw_chunks
+    # corridors can't cover the highway — never balloons to +70 min cuts just because
+    # the route is long.
+    eff_gap_km = max(settings.scout_junction_gap_km, total_hw_km / settings.scout_max_raw_chunks)
     eff_chunk_km = max(settings.scout_chunk_km, total_hw_km / settings.scout_max_raw_chunks)
-    chunks = classify.build_chunks(
+    steps, factors, flags, chunks = await _chunk_route(
         steps,
-        flags,
         factors,
+        flags,
         settings,
-        chunk_km=eff_chunk_km,
+        junction_gap_m=eff_gap_km * 1000,
+        fallback_chunk_m=eff_chunk_km * 1000,
         max_chunks=settings.scout_max_raw_chunks,
     )
     if emit is not None:

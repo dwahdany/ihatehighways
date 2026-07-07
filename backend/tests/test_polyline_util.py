@@ -49,3 +49,27 @@ def test_haversine_known_distance():
     assert abs(d - 111_195) / 111_195 < 0.01
     d_eq = polyline_util.haversine_m((0.0, 0.0), (0.0, 1.0))
     assert abs(d_eq - 111_195) / 111_195 < 0.01
+
+
+def test_point_and_bearing_at_distance():
+    from app.polyline_util import bearing_at_distance_m, haversine_m, point_at_distance_m
+
+    north = [(50.0, 7.0), (50.09, 7.0)]  # ~10 km due north
+    mid = point_at_distance_m(north, 5_000)
+    assert abs(haversine_m(north[0], mid) - 5_000) < 5
+    assert bearing_at_distance_m(north, 5_000) in (0, 360)
+    assert point_at_distance_m(north, 99_000) == north[-1]
+    assert bearing_at_distance_m(north, 99_000) in (0, 360)
+
+
+def test_project_arclen_m():
+    from app.polyline_util import project_arclen_m
+
+    north = [(50.0, 7.0), (50.045, 7.0), (50.09, 7.0)]  # ~10 km, one mid vertex
+    east_20m = 20.0 / (111_320.0 * 0.6428)  # ~20 m in degrees longitude at lat 50
+    arclen, dist = project_arclen_m((50.027, 7.0 + east_20m), north)
+    assert abs(dist - 20.0) < 2.0
+    assert abs(arclen - 0.027 * 111_195.0) < 20.0
+    # A point before the path start projects to arclen 0.
+    arclen, _ = project_arclen_m((49.99, 7.0), north)
+    assert arclen == 0.0

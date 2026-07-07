@@ -180,7 +180,7 @@ def test_scout_probes_launch_while_scoring_still_runs(monkeypatch):
     chunks = [make_chunk(i) for i in range(8)]
     order: list[str] = []
 
-    async def fake_score_chunks(pairs, s, deadline_s=None, on_batch=None):
+    async def fake_score_chunks(pairs, s, deadline_s=None, on_batch=None, bbox_batch=None):
         assert on_batch is not None
         on_batch(pairs[:3], [10.0, 9.0, 8.0])  # adjacent, clearly good
         await asyncio.sleep(0.05)  # the rest of "scoring" takes a while
@@ -296,3 +296,87 @@ def test_scout_api_contract():
         for part in data["skeleton"]:
             assert set(part) == {"kind", "encoded_polyline", "duration_s", "distance_m", "cut_id"}
             assert part["kind"] in {"kept", "highway"}
+
+
+def test_scout_junction_aligned_cuts(monkeypatch):
+    """End-to-end junction path: the cut's entry lands just upstream of the OSM exit
+    node (never mid-carriageway past it), and the skeleton splits exactly there."""
+    from app import planner
+    from app.google_routes import GLeg, GRoute, GStep
+    from tests.test_classify import make_run
+
+    M_PER_DEG_LAT = 111_195.0
+    settings = Settings(
+        _env_file=None, ihh_mock=False, osm_enabled=True, junction_chunks_enabled=True
+    )
+    base_steps = make_run(
+        [(2_000, 55, "Head north", "")]
+        + [(5_000, 115, "Continue on A3", "")] * 10
+        + [(2_000, 55, "Follow K7", "")]
+    )
+    # One exit 18 km into the stretch (20 km global), 8 m east of the carriageway.
+    node = (50.0 + 20_000 / M_PER_DEG_LAT, 7.0 + 8.0 / 71_541.0)
+
+    async def fake_fetch_junctions(polylines, s):
+        assert len(polylines) == 1  # one motorway stretch
+        return [[node]]
+
+    async def fake_score_chunks(pairs, s, deadline_s=None, on_batch=None, bbox_batch=None):
+        scores = [0.1] * len(pairs)
+        scores[-1] = 10.0  # only the last (post-exit) corridor is worth riding
+        if on_batch is not None:
+            on_batch(pairs, scores)
+        return scores
+
+    monkeypatch.setattr(planner.osm, "fetch_junctions", fake_fetch_junctions)
+    monkeypatch.setattr(planner.osm, "score_chunks", fake_score_chunks)
+
+    class JunctionClient:
+        async def compute_route(self, origin, destination, avoid_highways=False, origin_heading=None):
+            if not avoid_highways:
+                static = sum(s.static_duration_s for s in base_steps)
+                dist = sum(s.distance_m for s in base_steps)
+                pts: list = []
+                for s in base_steps:
+                    pts.extend(polyline_util.decode(s.encoded_polyline))
+                return GRoute(
+                    static, static, dist, polyline_util.encode(pts), [GLeg(static, static, dist, base_steps)]
+                )
+            start, end = origin.lat_lng, destination.lat_lng
+            assert origin_heading is not None
+            distance = polyline_util.haversine_m(start, end) * 1.3
+            static = distance / (60 / 3.6)
+            step = GStep(
+                distance_m=distance,
+                static_duration_s=static,
+                encoded_polyline=polyline_util.encode([start, end]),
+                maneuver="",
+                instructions="Follow the country roads",
+                start=start,
+                end=end,
+            )
+            return GRoute(static, static, distance, step.encoded_polyline, [GLeg(static, static, distance, [step])])
+
+    req = ScoutRequest(
+        origin=PlacePoint(lat_lng=LatLng(lat=50.0, lng=7.0)),
+        destination=PlacePoint(address="somewhere north"),
+    )
+    resp = asyncio.run(scout(req, JunctionClient(), settings))
+
+    assert len(resp.cuts) == 1
+    cut = resp.cuts[0]
+    # Entry sits probe_entry_back_m UPSTREAM of the exit node — the probe's "take the
+    # next exit" is exactly this exit, so no ride-past-and-double-back is possible.
+    entry_lat_m = (cut.entry.lat - 50.0) * M_PER_DEG_LAT
+    assert abs(entry_lat_m - (20_000 - settings.probe_entry_back_m)) < 40
+    # The skeleton splits exactly at the entry: pin, skeleton, and detour agree.
+    part = next(p for p in resp.skeleton if p.cut_id == cut.id)
+    first_pt = polyline_util.decode(part.encoded_polyline)[0]
+    assert polyline_util.haversine_m(first_pt, (cut.entry.lat, cut.entry.lng)) < 5
+    # Skeleton stays contiguous through the junction-aligned splits.
+    prev_end = None
+    for p in resp.skeleton:
+        pts = polyline_util.decode(p.encoded_polyline)
+        if prev_end is not None:
+            assert polyline_util.haversine_m(prev_end, pts[0]) < 100
+        prev_end = pts[-1]

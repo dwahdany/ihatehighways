@@ -65,10 +65,12 @@ def _cache_key(pair: tuple[Point, Point]) -> str:
 def _load_cache() -> dict[str, tuple[float, float]]:
     global _cache
     if _cache is None:
+        # Broad except: a wrong-shape-but-valid-JSON file (e.g. from interleaved
+        # multi-worker writes) must self-heal to {}, not fail every request forever.
         try:
             raw = json.loads(CACHE_FILE.read_text())
             _cache = {k: (float(v[0]), float(v[1])) for k, v in raw.items()}
-        except (OSError, ValueError):
+        except Exception:
             _cache = {}
     return _cache
 
@@ -158,16 +160,16 @@ def score_ways(
     return scores
 
 
-async def _fetch_batch(
-    pairs: list[tuple[Point, Point]], settings: Settings, http: httpx.AsyncClient
-) -> list[float] | None:
-    """Score a batch of chunk corridors in one query, trying each mirror once."""
+async def _post_overpass(
+    query: str, settings: Settings, http: httpx.AsyncClient
+) -> dict | None:
+    """POST one Overpass query, trying each mirror once (with 429 cooldowns)."""
     mirrors = [u.strip() for u in settings.osm_overpass_urls.split(",") if u.strip()]
     for url in mirrors:
         if time.time() < _mirror_cooldown.get(url, 0):
             continue
         try:
-            resp = await http.post(url, data={"data": _query(pairs, settings)})
+            resp = await http.post(url, data={"data": query})
             resp.raise_for_status()
             body = resp.json()
         except httpx.HTTPStatusError as exc:
@@ -183,8 +185,181 @@ async def _fetch_batch(
         if body.get("remark"):  # server-side timeout returns 200 + empty elements
             logger.info("Overpass mirror %s remark: %s", url, body["remark"])
             continue
-        return score_ways(body.get("elements") or [], pairs, settings.osm_bbox_pad_m)
+        return body
     return None
+
+
+async def _fetch_batch(
+    pairs: list[tuple[Point, Point]], settings: Settings, http: httpx.AsyncClient
+) -> list[float] | None:
+    """Score a batch of chunk corridors in one query, trying each mirror once."""
+    body = await _post_overpass(_query(pairs, settings), settings, http)
+    if body is None:
+        return None
+    return score_ways(body.get("elements") or [], pairs, settings.osm_bbox_pad_m)
+
+
+# --- Motorway junction (exit) nodes -----------------------------------------------
+#
+# highway=motorway_junction nodes along each highway stretch feed junction-aligned
+# chunk boundaries (junctions.py). Node-by-tag bbox queries are cheap server-side;
+# results are cached like corridor scores (ODbL permits it).
+
+JUNCTION_CACHE_FILE = Path(__file__).resolve().parent.parent / ".cache" / "osm_junctions.json"
+JUNCTION_SEGMENT_M = 30_000.0  # stretch polylines are bboxed in segments of this length
+JUNCTION_BBOX_BATCH = 12  # node queries are cheap; more boxes per query than scoring
+
+_junction_cache: dict[str, tuple[list[list[float]], float]] | None = None
+
+
+def _load_junction_cache() -> dict[str, tuple[list[list[float]], float]]:
+    global _junction_cache
+    if _junction_cache is None:
+        # Broad except: see _load_cache — corrupt shapes must self-heal, or junction
+        # chunking stays silently disabled on every request.
+        try:
+            raw = json.loads(JUNCTION_CACHE_FILE.read_text())
+            _junction_cache = {k: (list(v[0]), float(v[1])) for k, v in raw.items()}
+        except Exception:
+            _junction_cache = {}
+    return _junction_cache
+
+
+def _save_junction_cache() -> None:
+    if _junction_cache is None:
+        return
+    try:
+        JUNCTION_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        JUNCTION_CACHE_FILE.write_text(
+            json.dumps({k: [v[0], v[1]] for k, v in _junction_cache.items()})
+        )
+    except OSError as exc:
+        logger.debug("could not persist OSM junction cache: %s", exc)
+
+
+def _points_bbox(pts: list[Point], pad_m: float) -> tuple[float, float, float, float]:
+    lats = [p[0] for p in pts]
+    lngs = [p[1] for p in pts]
+    lat_pad = pad_m / 111_320.0
+    mid = (min(lats) + max(lats)) / 2
+    lng_pad = pad_m / (111_320.0 * max(0.2, math.cos(math.radians(mid))))
+    return (min(lats) - lat_pad, min(lngs) - lng_pad, max(lats) + lat_pad, max(lngs) + lng_pad)
+
+
+def segment_bboxes(poly: list[Point], settings: Settings) -> list[tuple[float, float, float, float]]:
+    """Padded bboxes over ~JUNCTION_SEGMENT_M point runs of a stretch polyline.
+
+    Boxing the actual points (not chords) keeps boxes tight on curved stretches."""
+    boxes: list[tuple[float, float, float, float]] = []
+    cur: list[Point] = [poly[0]] if poly else []
+    acc = 0.0
+    for a, b in zip(poly, poly[1:]):
+        cur.append(b)
+        acc += polyline_util.haversine_m(a, b)
+        if acc >= JUNCTION_SEGMENT_M:
+            boxes.append(_points_bbox(cur, settings.osm_junction_pad_m))
+            cur = [b]
+            acc = 0.0
+    if len(cur) > 1 or not boxes:
+        boxes.append(_points_bbox(cur if len(cur) > 1 else poly, settings.osm_junction_pad_m))
+    return boxes
+
+
+def _junction_key(box: tuple[float, float, float, float]) -> str:
+    return ",".join(f"{v:.3f}" for v in box)
+
+
+def _junction_query(boxes: list[tuple[float, float, float, float]], settings: Settings) -> str:
+    statements = [
+        f"node[highway=motorway_junction]({s:.4f},{w:.4f},{n:.4f},{e:.4f});"
+        for s, w, n, e in boxes
+    ]
+    return f"[out:json][timeout:{int(settings.osm_timeout_s)}];({''.join(statements)});out body;"
+
+
+def _in_box(lat: float, lng: float, box: tuple[float, float, float, float]) -> bool:
+    s, w, n, e = box
+    return s <= lat <= n and w <= lng <= e
+
+
+async def fetch_junctions(
+    polylines: list[list[Point]], settings: Settings
+) -> list[list[Point] | None]:
+    """Motorway junction nodes near each stretch polyline; None entries mean unknown.
+
+    A stretch is only "known" when ALL its segment boxes resolved (from cache or a
+    query that answered within osm_junction_deadline_s) — a silently missing middle
+    segment would masquerade as a junction-free motorway and yield one giant chunk.
+    """
+    per_stretch = [segment_bboxes(poly, settings) if len(poly) >= 2 else [] for poly in polylines]
+    boxes_by_key: dict[str, tuple[float, float, float, float]] = {}
+    for boxes in per_stretch:
+        for box in boxes:
+            boxes_by_key[_junction_key(box)] = box
+
+    resolved: dict[str, list[list[float]]] = {}
+    async with _lock:
+        cache = _load_junction_cache()
+        now = time.time()
+        for key in boxes_by_key:
+            hit = cache.get(key)
+            if hit and now - hit[1] < CACHE_TTL_S:
+                resolved[key] = hit[0]
+    misses = [k for k in boxes_by_key if k not in resolved]
+
+    if misses:
+        batches = [
+            misses[i : i + JUNCTION_BBOX_BATCH] for i in range(0, len(misses), JUNCTION_BBOX_BATCH)
+        ]
+        semaphore = asyncio.Semaphore(MAX_PARALLEL_QUERIES)
+        fetched: dict[str, list[list[float]]] = {}
+
+        async def one(keys: list[str], http: httpx.AsyncClient) -> None:
+            async with semaphore:
+                boxes = [boxes_by_key[k] for k in keys]
+                body = await _post_overpass(_junction_query(boxes, settings), settings, http)
+                if body is None:
+                    return
+                nodes = [
+                    (float(el["lat"]), float(el["lon"]))
+                    for el in body.get("elements") or []
+                    if el.get("type") == "node" and "lat" in el and "lon" in el
+                ]
+                for key, box in zip(keys, boxes):
+                    fetched[key] = [[lat, lng] for lat, lng in nodes if _in_box(lat, lng, box)]
+
+        async with httpx.AsyncClient(
+            timeout=settings.osm_timeout_s + 5, headers={"User-Agent": USER_AGENT}
+        ) as http:
+            tasks = [asyncio.ensure_future(one(batch, http)) for batch in batches]
+            _, pending = await asyncio.wait(tasks, timeout=settings.osm_junction_deadline_s)
+            for task in pending:
+                task.cancel()
+            if pending:
+                logger.warning(
+                    "OSM junction deadline hit: %d/%d batches unresolved (falling back to "
+                    "distance chunking for affected stretches)",
+                    len(pending),
+                    len(batches),
+                )
+        if fetched:
+            async with _lock:
+                cache = _load_junction_cache()
+                now = time.time()
+                for key, nodes in fetched.items():
+                    resolved[key] = nodes
+                    cache[key] = (nodes, now)
+                _save_junction_cache()
+
+    out: list[list[Point] | None] = []
+    for boxes in per_stretch:
+        keys = [_junction_key(box) for box in boxes]
+        if not keys or any(k not in resolved for k in keys):
+            out.append(None)
+            continue
+        nodes = {(lat, lng) for k in keys for lat, lng in resolved[k]}
+        out.append([(lat, lng) for lat, lng in sorted(nodes)])
+    return out
 
 
 OnBatch = Callable[[list[tuple[Point, Point]], list[float]], None]
@@ -195,6 +370,7 @@ async def score_chunks(
     settings: Settings,
     deadline_s: float | None = None,
     on_batch: OnBatch | None = None,
+    bbox_batch: int | None = None,
 ) -> list[float | None]:
     """Score all chunk corridors; None entries mean "unknown" (callers must fail open).
 
@@ -225,7 +401,7 @@ async def score_chunks(
     if not misses:
         return results
 
-    batch_size = max(1, settings.osm_bbox_batch)
+    batch_size = max(1, bbox_batch if bbox_batch is not None else settings.osm_bbox_batch)
     batches = [misses[i : i + batch_size] for i in range(0, len(misses), batch_size)]
     semaphore = asyncio.Semaphore(MAX_PARALLEL_QUERIES)
     scored: dict[int, float] = {}

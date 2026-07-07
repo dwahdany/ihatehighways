@@ -90,6 +90,61 @@ def atomize_steps(
     return out_steps, out_factors
 
 
+def split_step_at(step: GStep, offsets_m: Sequence[float]) -> list[GStep]:
+    """Split one step at the given offsets (meters along its polyline).
+
+    Distance and static duration are prorated by slice polyline length; the first
+    slice keeps the maneuver. Offsets outside (1 m, length - 1 m) are ignored;
+    returns [step] when there is nothing to cut.
+    """
+    pts = polyline_util.decode(step.encoded_polyline) if step.encoded_polyline else []
+    if len(pts) < 2:
+        return [step]
+    total = polyline_util.path_length_m(pts)
+    offs = sorted({o for o in offsets_m if 1.0 < o < total - 1.0})
+    if not offs or total <= 0:
+        return [step]
+    slices: list[list[Point]] = []
+    cur: list[Point] = [pts[0]]
+    acc = 0.0
+    a = pts[0]
+    idx = 1
+    oi = 0
+    while idx < len(pts):
+        b = pts[idx]
+        seg = polyline_util.haversine_m(a, b)
+        if oi < len(offs) and seg > 0 and acc + seg >= offs[oi]:
+            t = (offs[oi] - acc) / seg
+            cut = _lerp(a, b, t)
+            cur.append(cut)
+            slices.append(cur)
+            cur = [cut]
+            a = cut
+            acc = offs[oi]
+            oi += 1
+        else:
+            cur.append(b)
+            acc += seg
+            a = b
+            idx += 1
+    slices.append(cur)
+    out: list[GStep] = []
+    for i, slice_pts in enumerate(slices):
+        frac = polyline_util.path_length_m(slice_pts) / total
+        out.append(
+            GStep(
+                distance_m=step.distance_m * frac,
+                static_duration_s=step.static_duration_s * frac,
+                encoded_polyline=polyline_util.encode(slice_pts),
+                maneuver=step.maneuver if i == 0 else "",
+                instructions=step.instructions,
+                start=slice_pts[0],
+                end=slice_pts[-1],
+            )
+        )
+    return out
+
+
 def step_speed_kmh(step: GStep) -> float:
     """Average static speed of a step in km/h."""
     if step.static_duration_s <= 0:
@@ -185,8 +240,12 @@ def _split_stretch(
 
 def _entry_heading(step: GStep) -> int:
     pts = polyline_util.decode(step.encoded_polyline) if step.encoded_polyline else []
-    if len(pts) >= 2:
-        return polyline_util.initial_bearing_deg(pts[0], pts[1])
+    # Skip leading duplicates: a split point that quantizes onto the next vertex at
+    # polyline precision 5 (~0.5 m) would otherwise yield bearing(p, p) = 0, and a
+    # wrong heading sends the paid probe off in the wrong direction.
+    for q in pts[1:]:
+        if q != pts[0]:
+            return polyline_util.initial_bearing_deg(pts[0], q)
     return polyline_util.initial_bearing_deg(step.start, step.end)
 
 

@@ -33,10 +33,33 @@ least time to replace — and traffic jams make some replacements *free*.
      absorbed into the highway stretch (interchanges, service areas).
 
 3. **Stretches → chunks** — contiguous highway runs ≥ `MIN_STRETCH_KM` (12) become detour
-   candidates. Each stretch is split at step boundaries into chunks, adaptively enlarged so
-   total chunks ≤ `MAX_CHUNKS` (10). Chunks are the unit of optimization: on a 300 km Autobahn
-   haul you rarely want to replace all of it — you want the best 40 km.
-   **Chunk size adapts to the budget:** replacing one highway km costs roughly
+   candidates. Chunks are the unit of optimization: on a 300 km Autobahn haul you rarely want
+   to replace all of it — you want the best 40 km.
+
+   **Junction-aligned boundaries** (`junctions.py`): motorway exits are the real action space
+   — every cut is "leave at exit *i*, rejoin at exit *j*" — so chunk boundaries snap to
+   interchanges. Free OSM `highway=motorway_junction` nodes along each stretch
+   (`osm.fetch_junctions`, segment-bboxed Overpass node queries, 30-day disk cache, hard
+   `OSM_JUNCTION_DEADLINE_S` (10) after which affected stretches fall back to the old
+   distance splitting) are projected onto the base polyline; nodes farther than
+   `JUNCTION_SNAP_M` (20) are the opposite carriageway and get dropped (erring tight: a
+   phantom boundary at an oncoming-only exit would reintroduce the double-back), survivors
+   within `JUNCTION_CLUSTER_M` (900) collapse into one interchange, capped at 2× that span
+   so dense urban exit sequences can't chain into one multi-km "interchange". Boundary
+   picking treats the size target as a *ceiling*: cut at the last exit before the chunk
+   would exceed it (scout targets `SCOUT_JUNCTION_GAP_KM` (6, ≈ every 1–2 exits); /api/plan
+   targets the budget-adaptive size below — a floor would price every cut above the budget).
+   Chunks tile at `cut_m` = first node − `PROBE_ENTRY_BACK_M` (250): the step list is
+   re-sliced there, so probe origin, skeleton split, and the client's entry pin are the same
+   point, just upstream of the exit's diverge. A chunk's probe *destination* overshoots its
+   far interchange to last node + `PROBE_EXIT_FWD_M` (900) so the on-ramp (which merges
+   downstream of the exit nodes) can reach it — a bounded stub of honest carriageway inside
+   the detour instead of a one-exit backtrack. Because of that overshoot, ADJACENT
+   junction-aligned cuts can't coexist in one ride; the scout keeps a one-chunk separator
+   between launched spans, and /api/plan's merge fallback keeps the best non-overlapping
+   subset.
+
+   **Chunk size adapts to the budget (/api/plan):** replacing one highway km costs roughly
    `DETOUR_EXTRA_PER_HW_KM_S` (30 s) extra, so chunks are sized near
    `budget / 30 s-per-km`, clamped to [`MIN_CHUNK_KM` (15), `MAX_CHUNK_KM` (45)]. Without
    this, a 15-minute budget can't afford any 45 km chunk on a long haul (~+25 min each) and
@@ -55,9 +78,13 @@ least time to replace — and traffic jams make some replacements *free*.
    concurrent slots per IP (2 lanes + mirror failover).
 
 4. **Detour query per chunk** (parallel) — `computeRoutes(entry→exit, avoidHighways: true,
-   TRAFFIC_AWARE)` where entry/exit are chunk boundary lat/lngs. Set origin `heading` to the base
-   polyline's bearing at entry so routing can't start backwards. `avoidHighways` is *soft*
-   avoidance, so mid-motorway endpoints resolve naturally to "take the next exit".
+   TRAFFIC_AWARE)` where entry/exit are the chunk's probe points. Set origin `heading` to the
+   base polyline's bearing at entry so routing can't start backwards. `avoidHighways` is *soft*
+   avoidance, so an on-carriageway origin resolves to "take the next exit" — with
+   junction-aligned entries the next exit IS the boundary's interchange. (With the old
+   distance-based boundaries this same mechanism caused ride-past-and-double-back cuts when
+   the entry landed just downstream of the exit the detour road needed; fallback distance
+   chunks can still exhibit it.)
    Per chunk compute:
    - `baseline = Σ step.staticDuration × traffic_factor`, with
      `traffic_factor = leg.duration / leg.staticDuration` from the base route
