@@ -4,8 +4,7 @@
  *
  * Same-origin keeps CORS out of the picture entirely; the Worker forwards the real
  * client IP so the backend's per-IP rate limiting works behind the proxy chain
- * (browser → Cloudflare → container). While API_ORIGIN is set, a container failure
- * (not an app error) falls back to the legacy Render origin.
+ * (browser → Cloudflare → container).
  */
 
 import { Container } from '@cloudflare/containers'
@@ -13,7 +12,6 @@ import { Container } from '@cloudflare/containers'
 interface Env {
   ASSETS: Fetcher
   BACKEND: any // DurableObjectNamespace<Backend>
-  API_ORIGIN?: string
   GOOGLE_MAPS_API_KEY: string
 }
 
@@ -38,21 +36,11 @@ export default {
       const headers = new Headers(request.headers)
       const clientIp = request.headers.get('cf-connecting-ip')
       if (clientIp) headers.set('x-forwarded-for', clientIp)
-      const upstream = new Request(request, { headers })
-      try {
-        // Singleton: the backend's in-memory rate limits and route TTL cache assume
-        // one instance, exactly like the old single Render dyno.
-        const backend = env.BACKEND.getByName('api')
-        await backend.startAndWaitForPorts()
-        return await backend.fetch(upstream)
-      } catch (err) {
-        // Container infra failure (start timeout, capacity) — NOT app 4xx/5xx.
-        if (env.API_ORIGIN) {
-          console.error('container unavailable, falling back to legacy origin', err)
-          return fetch(new URL(url.pathname + url.search, env.API_ORIGIN), upstream)
-        }
-        throw err
-      }
+      // Singleton: the backend's in-memory rate limits and route TTL cache assume
+      // one instance.
+      const backend = env.BACKEND.getByName('api')
+      await backend.startAndWaitForPorts()
+      return backend.fetch(new Request(request, { headers }))
     }
     return env.ASSETS.fetch(request)
   },

@@ -73,9 +73,6 @@ the other backend env vars live in the `Backend` container class in
 `worker/wrangler.jsonc`. The container's disk is ephemeral: the 30-day OSM caches reset
 whenever it sleeps (warm-start loss only).
 
-Legacy: [`render.yaml`](render.yaml) still describes the old Render deployment, kept as
-the `API_ORIGIN` fallback until the Render service is retired.
-
 Corridor pre-filtering uses OpenStreetMap data via Overpass
 (© OpenStreetMap contributors, ODbL) to decide which Google queries are worth making.
 

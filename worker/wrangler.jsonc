@@ -27,10 +27,6 @@
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["Backend"] }
   ],
-  "vars": {
-    // Legacy Render origin: fallback while it still exists; remove once retired.
-    "API_ORIGIN": "https://ihatehighways-api.onrender.com"
-  },
   "routes": [
     { "pattern": "ihatehighways.wahdany.eu", "custom_domain": true }
   ]
