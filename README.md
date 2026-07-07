@@ -56,14 +56,25 @@ Tests: `cd backend && uv run pytest`.
 
 ## Deploy
 
-- **Backend** — Render free tier via [`render.yaml`](render.yaml) (Docker, spins down when
-  idle; set `GOOGLE_MAPS_API_KEY` in the dashboard). Per-IP and daily rate limits guard
-  the Google quota.
-- **Frontend** — Cloudflare Worker in [`worker/`](worker/) serves the built frontend and
-  proxies `/api` same-origin to the backend:
-  `cd frontend && nix-shell -p nodejs_22 --run 'npm run build'`, then
-  `cd worker && npx wrangler deploy`. The custom domain is configured in
-  `worker/wrangler.jsonc`.
+Everything runs on Cloudflare (paid Workers plan): the Worker in [`worker/`](worker/)
+serves the built frontend and runs the FastAPI backend as a **Cloudflare Container**
+(built from [`backend/Dockerfile`](backend/Dockerfile), singleton instance, `basic`
+size, sleeps after 30 min idle — cold start ~2-4 s). Same-origin `/api` keeps CORS out
+of the picture; per-IP and daily rate limits guard the Google quota.
+
+```sh
+cd frontend && nix-shell -p nodejs_22 --run 'npm run build'
+cd ../worker && npm install && npx wrangler deploy   # needs Docker running for the image build
+```
+
+`GOOGLE_MAPS_API_KEY` is a Worker secret (`npx wrangler secret put GOOGLE_MAPS_API_KEY`);
+the other backend env vars live in the `Backend` container class in
+[`worker/src/index.ts`](worker/src/index.ts). The custom domain is configured in
+`worker/wrangler.jsonc`. The container's disk is ephemeral: the 30-day OSM caches reset
+whenever it sleeps (warm-start loss only).
+
+Legacy: [`render.yaml`](render.yaml) still describes the old Render deployment, kept as
+the `API_ORIGIN` fallback until the Render service is retired.
 
 Corridor pre-filtering uses OpenStreetMap data via Overpass
 (© OpenStreetMap contributors, ODbL) to decide which Google queries are worth making.

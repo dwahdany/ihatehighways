@@ -1,5 +1,7 @@
-// Cloudflare Worker: serves the built frontend and proxies /api to the backend.
-// Deploy: cd frontend && npm run build, then cd ../worker && npx wrangler deploy
+// Cloudflare Worker: serves the built frontend and runs the FastAPI backend as a
+// Cloudflare Container (backend/Dockerfile).
+// Deploy: cd frontend && npm run build, then cd ../worker && npm install && npx wrangler deploy
+// (needs Docker running locally for the container image build).
 {
   "name": "ihatehighways",
   "main": "src/index.ts",
@@ -9,8 +11,24 @@
     "binding": "ASSETS",
     "not_found_handling": "single-page-application"
   },
+  "containers": [
+    {
+      "class_name": "Backend",
+      "image": "../backend/Dockerfile",
+      "instance_type": "basic", // 1/4 vCPU, 1 GiB — the app is IO-bound
+      "max_instances": 2 // singleton via getByName; 2 leaves room for rolling deploys
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "BACKEND", "class_name": "Backend" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Backend"] }
+  ],
   "vars": {
-    // Render backend origin; update after the Render service exists.
+    // Legacy Render origin: fallback while it still exists; remove once retired.
     "API_ORIGIN": "https://ihatehighways-api.onrender.com"
   },
   "routes": [
